@@ -1,0 +1,3322 @@
+<contexto>
+Soy desarrollador de un sistema de gestión para una clínica de fisioterapia usando Vue.js y Supabase (PostgreSQL). Quiero que actúes como un Tech Lead Senior y hagas una auditoría estricta buscando malas prácticas, vulnerabilidades, redundancias lógicas y posibles cuellos de botella. Limítate a analizar este módulo específico.
+</contexto>
+
+<database_schema>
+--- 20260615211954_remote_schema.sql ---
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+
+CREATE EXTENSION IF NOT EXISTS "pg_cron" WITH SCHEMA "pg_catalog";
+
+
+
+
+
+
+COMMENT ON SCHEMA "public" IS 'standard public schema';
+
+
+
+CREATE EXTENSION IF NOT EXISTS "pg_stat_statements" WITH SCHEMA "extensions";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA "extensions";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "supabase_vault" WITH SCHEMA "vault";
+
+
+
+
+
+
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp" WITH SCHEMA "extensions";
+
+
+
+
+
+
+CREATE TYPE "public"."estado_Tratamiento" AS ENUM (
+    'en_progreso',
+    'finalizado',
+    'abandonado'
+);
+
+
+ALTER TYPE "public"."estado_Tratamiento" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."estado_financiero_paquete" AS ENUM (
+    'pendiente',
+    'parcial',
+    'pagado',
+    'vencido',
+    'cancelado'
+);
+
+
+ALTER TYPE "public"."estado_financiero_paquete" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."estado_pago" AS ENUM (
+    'pendiente',
+    'completado',
+    'reembolsado',
+    'fallido'
+);
+
+
+ALTER TYPE "public"."estado_pago" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."estado_promocion" AS ENUM (
+    'activa',
+    'inactiva'
+);
+
+
+ALTER TYPE "public"."estado_promocion" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."estado_sesion" AS ENUM (
+    'reservada',
+    'agendada',
+    'atendida',
+    'cancelada',
+    'no_asistio',
+    'reprogramada'
+);
+
+
+ALTER TYPE "public"."estado_sesion" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."metodo_pago" AS ENUM (
+    'efectivo',
+    'tarjeta',
+    'yape',
+    'plin'
+);
+
+
+ALTER TYPE "public"."metodo_pago" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."tipo_descuento" AS ENUM (
+    'porcentaje',
+    'monto_fijo'
+);
+
+
+ALTER TYPE "public"."tipo_descuento" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."tipo_documento" AS ENUM (
+    'DNI',
+    'CE',
+    'PAS'
+);
+
+
+ALTER TYPE "public"."tipo_documento" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."tipo_saldo" AS ENUM (
+    'paquete',
+    'sesion_suelta',
+    'bonificacion'
+);
+
+
+ALTER TYPE "public"."tipo_saldo" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."tipo_sesion" AS ENUM (
+    'evaluacion',
+    'tratamiento_control'
+);
+
+
+ALTER TYPE "public"."tipo_sesion" OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."crear_sesiones_futuras"("p_id_tratamiento" bigint, "p_id_fisioterapeuta" "uuid", "p_id_paciente" "uuid", "p_total_sesiones" smallint, "p_fecha_primera" timestamp with time zone, "p_intervalo_dias" integer) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    AS $$
+DECLARE
+  i int;
+BEGIN
+  FOR i IN 2..p_total_sesiones LOOP
+    INSERT INTO public."Sesion" (
+      "idTratamiento", "idFisioterapeuta", "idPaciente",
+      numero_sesion, fecha_hora, estado
+    ) VALUES (
+      p_id_tratamiento,
+      p_id_fisioterapeuta,
+      p_id_paciente,
+      i,
+      p_fecha_primera + ((i - 1) * p_intervalo_dias * INTERVAL '1 day'),
+      'confirmada'
+    );
+  END LOOP;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."crear_sesiones_futuras"("p_id_tratamiento" bigint, "p_id_fisioterapeuta" "uuid", "p_id_paciente" "uuid", "p_total_sesiones" smallint, "p_fecha_primera" timestamp with time zone, "p_intervalo_dias" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."fn_gestion_sesiones_inteligente"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+    -- Aquí NO usamos NEW.sesiones_disponibles porque no existe en Sesion
+    -- Actualizamos directamente la tabla de saldos
+    IF NEW.estado = 'atendida' THEN
+        UPDATE public."Saldo_Sesiones"
+        SET "sesiones_disponibles" = "sesiones_disponibles" - 1
+        WHERE "idPaciente" = NEW."idPaciente";
+    END IF;
+    
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."fn_gestion_sesiones_inteligente"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."fn_gestionar_sesiones_atencion"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$BEGIN
+    -- Solo actuar si el estado cambió a 'atendida' y antes no lo estaba
+    IF NEW.estado = 'atendida' AND (OLD.estado IS DISTINCT FROM 'atendida') THEN
+        
+        -- 1. DESCONTAR SESIÓN (Solo si NO es evaluación)
+        -- Si tu lógica es que la evaluación es gratuita, no restes nada.
+        IF NEW.tipo <> 'evaluacion' THEN
+            UPDATE "Saldo_Sesiones" 
+            SET "sesiones_disponibles" = "sesiones_disponibles" - 1
+            WHERE "idPaciente" = NEW."idPaciente" 
+            AND "sesiones_disponibles" > 0;
+        END IF;
+
+        -- 2. Lógica especial si fuera necesario (opcional)
+        -- Si la evaluación DEBE contar como una sesión usada, quita el IF anterior.
+        -- Si la evaluación es "gratuita" y no debe restar saldo, el IF anterior es correcto.
+    END IF;
+
+    RETURN NEW;
+END;$$;
+
+
+ALTER FUNCTION "public"."fn_gestionar_sesiones_atencion"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_my_rol"() RETURNS "text"
+    LANGUAGE "sql" STABLE
+    AS $$
+  SELECT coalesce(
+    (auth.jwt() -> 'user_metadata' ->> 'rol'),
+    'sin_rol'
+  );
+$$;
+
+
+ALTER FUNCTION "public"."get_my_rol"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."handle_new_user"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  INSERT INTO public."Persona" (
+    "idPersona", 
+    "nombres", 
+    "apellidos", 
+    "tipo_documento", 
+    "numero_documento", 
+    "celular",
+    "fecha_nacimiento"
+  )
+  VALUES (
+    NEW.id, 
+    COALESCE(NEW.raw_user_meta_data->>'nombres', 'Nuevo'), 
+    COALESCE(NEW.raw_user_meta_data->>'apellidos', 'Usuario'),
+    (COALESCE(NEW.raw_user_meta_data->>'tipo_documento', 'DNI'))::text::public.tipo_documento, 
+    NEW.raw_user_meta_data->>'numero_documento',   
+    NEW.raw_user_meta_data->>'celular',
+    (NULLIF(NEW.raw_user_meta_data->>'fecha_nacimiento', ''))::date           
+  );
+  
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."handle_new_user"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."registrar_estado_financiero_paquete"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+DECLARE
+    v_monto_total numeric(10,2);
+    v_monto_pagado numeric(10,2);
+    v_saldo_pendiente numeric(10,2);
+    v_fecha_vencimiento date;
+    v_estado_actual public.estado_financiero_paquete;
+BEGIN
+    -- 1. Obtenemos los datos del paquete afectado
+    SELECT monto_total, monto_pagado, fecha_vencimiento, estado_pago 
+    INTO v_monto_total, v_monto_pagado, v_fecha_vencimiento, v_estado_actual
+    FROM public."Paquete" 
+    WHERE "idPaquete" = NEW."idPaquete";
+
+    -- Si el administrador canceló manualmente la deuda, se respeta el candado de tu matriz
+    IF v_estado_actual = 'cancelado' THEN
+        RETURN NEW;
+    END IF;
+
+    v_saldo_pendiente := v_monto_total - v_monto_pagado;
+
+    -- 2. Aplicamos las Reglas de Negocio exactas de tu matriz
+    IF v_monto_pagado = 0 THEN
+        UPDATE public."Paquete" SET estado_pago = 'pendiente' WHERE "idPaquete" = NEW."idPaquete";
+    ELSIF v_saldo_pendiente = 0 THEN
+        UPDATE public."Paquete" SET estado_pago = 'pagado' WHERE "idPaquete" = NEW."idPaquete";
+    ELSIF v_saldo_pendiente > 0 AND v_fecha_vencimiento < CURRENT_DATE THEN
+        UPDATE public."Paquete" SET estado_pago = 'vencido' WHERE "idPaquete" = NEW."idPaquete";
+    ELSIF v_monto_pagado > 0 AND v_saldo_pendiente > 0 THEN
+        UPDATE public."Paquete" SET estado_pago = 'parcial' WHERE "idPaquete" = NEW."idPaquete";
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."registrar_estado_financiero_paquete"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."validar_fecha_cita_futura"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+    -- Solo validamos la fecha si es una inserción nueva, 
+    -- o si es una actualización donde la fecha_hora realmente cambió.
+    IF TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND NEW.fecha_hora IS DISTINCT FROM OLD.fecha_hora) THEN
+        IF NEW.fecha_hora < (now() - interval '5 minutes') THEN
+            RAISE EXCEPTION 'Regla de negocio: La fecha y hora de la cita no puede ser en el pasado.';
+        END IF;
+    END IF;
+    
+    RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."validar_fecha_cita_futura"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."validar_transicion_estado_sesion"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$BEGIN
+    -- 1. Regla: Una sesión atendida es un documento clínico sellado. No se toca.
+    IF OLD.estado = 'atendida' AND NEW.estado != 'atendida' THEN
+        RAISE EXCEPTION 'Validación Clínica: Una sesión ya atendida no puede cambiar de estado.';
+    END IF;
+
+    -- 2. Regla: Una sesión cancelada queda congelada.
+    IF OLD.estado = 'cancelada' THEN
+        RAISE EXCEPTION 'Validación Administrativa: Una sesión cancelada no puede ser modificada.';
+    END IF;
+
+    -- 3. Regla: El paciente faltó. No puedes decir que sí vino después.
+    IF OLD.estado = 'no_asistio' AND NEW.estado = 'atendida' THEN
+        RAISE EXCEPTION 'Validación Operativa: No se puede marcar como atendida una sesión con estado no_asistio.';
+    END IF;
+
+    -- 4. Regla: Solo las citas agendadas (y pagadas/válidas) pasan a atención.
+    IF NEW.estado = 'atendida' AND OLD.estado != 'agendada' THEN
+        RAISE EXCEPTION 'Validación Operativa: Solo las sesiones en estado agendada pueden pasar a atendidas.';
+    END IF;
+
+    IF NEW.estado = 'atendida' AND NEW.estado_pago != 'pagado' THEN
+        RAISE EXCEPTION 'No se puede atender la sesión: El pago está pendiente o incompleto.';
+    END IF;
+
+    -- 5. Regla: Control de Reprogramación Única (Candado Avanzado)
+    IF NEW.estado = 'reprogramada' AND OLD.estado = 'reprogramada' THEN
+        RAISE EXCEPTION 'Validación Operativa: Una sesión reprogramada queda bloqueada para posteriores modificaciones.';
+    END IF;
+
+    IF NEW.estado = 'reprogramada' AND OLD."idSesionOriginal" IS NOT NULL THEN
+        RAISE EXCEPTION 'Validación de Negocio: Esta cita ya es fruto de una reprogramación previa. No se permite re-reprogramar.';
+    END IF;
+
+    RETURN NEW;
+END;$$;
+
+
+ALTER FUNCTION "public"."validar_transicion_estado_sesion"() OWNER TO "postgres";
+
+SET default_tablespace = '';
+
+SET default_table_access_method = "heap";
+
+
+CREATE TABLE IF NOT EXISTS "public"."Antecedentes" (
+    "idAntecedentes" bigint NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "idPaciente" "uuid" NOT NULL,
+    "alergias" "text",
+    "familiares" "text",
+    "traumatologicos" "text",
+    "quirurgicos" "text",
+    "observaciones" "text",
+    "update_at" timestamp with time zone DEFAULT ("now"() AT TIME ZONE 'utc'::"text") NOT NULL
+);
+
+
+ALTER TABLE "public"."Antecedentes" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."Antecedentes" ALTER COLUMN "idAntecedentes" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."Antecedentes_idAntecedentes_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."Catalogo_Servicio" (
+    "idServicio" bigint NOT NULL,
+    "nombre" character varying NOT NULL,
+    "tipo" character varying NOT NULL,
+    "cantidad_sesiones" smallint DEFAULT 1 NOT NULL,
+    "precio" numeric(10,2) NOT NULL,
+    "activo" boolean DEFAULT true NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "precio_base" numeric(10,2) DEFAULT 0,
+    "cantidad_sesiones_incluidas" integer DEFAULT 1,
+    CONSTRAINT "Catalogo_Servicio_tipo_check" CHECK ((("tipo")::"text" = ANY ((ARRAY['sesion_suelta'::character varying, 'paquete'::character varying])::"text"[])))
+);
+
+
+ALTER TABLE "public"."Catalogo_Servicio" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."Catalogo_Servicio" ALTER COLUMN "idServicio" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."Catalogo_Servicio_idServicio_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."Evaluacion" (
+    "idEvaluacion" bigint NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "nombre" character varying NOT NULL,
+    "descripcion" "text",
+    "valor_min" smallint NOT NULL,
+    "valor_max" smallint NOT NULL
+);
+
+
+ALTER TABLE "public"."Evaluacion" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."Evaluacion" ALTER COLUMN "idEvaluacion" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."Evaluacion_idEvaluacion_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."Evaluacion_inicial" (
+    "idEvaluacionInicial" bigint NOT NULL,
+    "idPaciente" "uuid" NOT NULL,
+    "idFisioterapeuta" "uuid" NOT NULL,
+    "fecha" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "motivo_consulta" "text" NOT NULL,
+    "apuntes_generales" "text" NOT NULL,
+    "ejercicios_realizados" "text",
+    "observaciones" "text",
+    "idSesion" bigint NOT NULL,
+    "idTratamiento" bigint
+);
+
+
+ALTER TABLE "public"."Evaluacion_inicial" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."Evaluacion_inicial" ALTER COLUMN "idEvaluacionInicial" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."Evaluacion_inicial_idEvaluacionInicial_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."Fisioterapeuta" (
+    "idFisioterapeuta" "uuid" DEFAULT "auth"."uid"() NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "especialidad" character varying NOT NULL
+);
+
+
+ALTER TABLE "public"."Fisioterapeuta" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."Historial_estado_sesion" (
+    "idHistorial" bigint NOT NULL,
+    "idSesion" bigint NOT NULL,
+    "estado_anterior" character varying NOT NULL,
+    "estado_nuevo" character varying NOT NULL,
+    "fecha_cambio" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "usuario_responsable" "uuid" NOT NULL,
+    "observacion" "text"
+);
+
+
+ALTER TABLE "public"."Historial_estado_sesion" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."Historial_estado_sesion" ALTER COLUMN "idHistorial" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."Historial_estado_sesion_idHistorial_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."Horario" (
+    "idHorario" bigint NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "idFisioterapeuta" "uuid" DEFAULT "auth"."uid"() NOT NULL,
+    "dia_semana" smallint NOT NULL,
+    "hora_inicio" time without time zone NOT NULL,
+    "hora_fin" time without time zone NOT NULL,
+    CONSTRAINT "Horario_dia_semana_check" CHECK ((("dia_semana" >= 1) AND ("dia_semana" <= 7)))
+);
+
+
+ALTER TABLE "public"."Horario" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."Horario" ALTER COLUMN "idHorario" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."Horario_idHorario_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."Paciente" (
+    "idPaciente" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "direccion" character varying
+);
+
+
+ALTER TABLE "public"."Paciente" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."Pago" (
+    "idPago" bigint NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "idPaciente" "uuid" NOT NULL,
+    "idSesion" bigint,
+    "monto" numeric(10,2) NOT NULL,
+    "metodo_pago" "public"."metodo_pago" NOT NULL,
+    "estado_pago" "public"."estado_pago" DEFAULT 'completado'::"public"."estado_pago" NOT NULL,
+    "id_transaccion_pasarela" "text",
+    "idPaquete" bigint,
+    "numero_operacion" character varying(50),
+    "idPromocion" bigint,
+    CONSTRAINT "pago_monto_check" CHECK (("monto" > 0.00))
+);
+
+
+ALTER TABLE "public"."Pago" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."Pago" ALTER COLUMN "idPago" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."Pago_idPago_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."Paquete" (
+    "idPaquete" bigint NOT NULL,
+    "idPaciente" "uuid" NOT NULL,
+    "nombre_paquete" character varying NOT NULL,
+    "total_sesiones" integer NOT NULL,
+    "monto_total" numeric(10,2) NOT NULL,
+    "monto_pagado" numeric(10,2) DEFAULT 0.00 NOT NULL,
+    "fecha_inicio" "date" DEFAULT CURRENT_DATE NOT NULL,
+    "fecha_vencimiento" "date",
+    "estado_pago" "public"."estado_financiero_paquete" DEFAULT 'pendiente'::"public"."estado_financiero_paquete" NOT NULL,
+    "idPromocion" bigint,
+    "idServicio" bigint,
+    CONSTRAINT "paquete_monto_pagado_check" CHECK (("monto_pagado" >= 0.00)),
+    CONSTRAINT "paquete_monto_total_check" CHECK (("monto_total" > 0.00))
+);
+
+
+ALTER TABLE "public"."Paquete" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."Paquete" ALTER COLUMN "idPaquete" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."Paquete_idPaquete_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."Persona" (
+    "idPersona" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "nombres" character varying NOT NULL,
+    "apellidos" character varying NOT NULL,
+    "celular" "text",
+    "fecha_nacimiento" "date",
+    "tipo_documento" "public"."tipo_documento" NOT NULL,
+    "numero_documento" "text",
+    CONSTRAINT "Persona_celular_check" CHECK ((("celular" IS NULL) OR ("length"("celular") = 9))),
+    CONSTRAINT "Persona_numero_documento_check" CHECK (("length"("numero_documento") <= 12)),
+    CONSTRAINT "check_documento_peru" CHECK ((("numero_documento" IS NULL) OR ((("tipo_documento" = 'DNI'::"public"."tipo_documento") AND ("numero_documento" ~ '^[0-9]{8}$'::"text")) OR (("tipo_documento" = 'CE'::"public"."tipo_documento") AND ("numero_documento" ~ '^[a-zA-Z0-9]{8,12}$'::"text")) OR (("tipo_documento" = 'PAS'::"public"."tipo_documento") AND ("numero_documento" ~ '^[a-zA-Z0-9]{6,12}$'::"text")))))
+);
+
+
+ALTER TABLE "public"."Persona" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."Promocion" (
+    "idPromocion" bigint NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "nombre" character varying NOT NULL,
+    "tipo_descuento" "public"."tipo_descuento" NOT NULL,
+    "valor" numeric NOT NULL,
+    "fecha_inicio" timestamp with time zone NOT NULL,
+    "fecha_fin" timestamp with time zone NOT NULL,
+    "estado" "public"."estado_promocion" NOT NULL,
+    "es_global" boolean NOT NULL
+);
+
+
+ALTER TABLE "public"."Promocion" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."Promocion" ALTER COLUMN "idPromocion" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."Promocion_idPromocion_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."Saldo_Sesiones" (
+    "idSaldo" bigint NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "idPaciente" "uuid" DEFAULT "auth"."uid"() NOT NULL,
+    "sesiones_disponibles" smallint DEFAULT '0'::smallint NOT NULL,
+    "tipo_saldo" "public"."tipo_saldo" NOT NULL
+);
+
+
+ALTER TABLE "public"."Saldo_Sesiones" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."Saldo_Sesiones" ALTER COLUMN "idSaldo" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."Saldo_Sesiones_idSaldo_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."Secretaria" (
+    "idSecretaria" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."Secretaria" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."Sesion" (
+    "idSesion" bigint NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "idTratamiento" bigint,
+    "idFisioterapeuta" "uuid" DEFAULT "auth"."uid"() NOT NULL,
+    "numero_sesion" smallint NOT NULL,
+    "fecha_hora" timestamp with time zone NOT NULL,
+    "notas_evolucion" "text",
+    "estado" "public"."estado_sesion" DEFAULT 'reservada'::"public"."estado_sesion" NOT NULL,
+    "indicaciones" "text",
+    "expires_at" timestamp with time zone,
+    "observaciones" "text",
+    "idPaquete" bigint,
+    "idSesionOriginal" bigint,
+    "idPaciente" "uuid" NOT NULL,
+    "tipo" "public"."tipo_sesion" DEFAULT 'tratamiento_control'::"public"."tipo_sesion" NOT NULL,
+    "paciente_en_sala" boolean DEFAULT false NOT NULL,
+    "idServicio" bigint,
+    "sesiones_a_generar" integer DEFAULT 0,
+    "estado_pago" "text" DEFAULT 'pendiente'::"text" NOT NULL,
+    "id_transaccion_referencia" "text",
+    CONSTRAINT "Sesion_estado_pago_check" CHECK (("estado_pago" = ANY (ARRAY['pendiente'::"text", 'parcial'::"text", 'pagado'::"text", 'cortesía'::"text"])))
+);
+
+
+ALTER TABLE "public"."Sesion" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."Sesion_Evaluacion" (
+    "idSesionEvaluacion" bigint NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "idSesion" bigint NOT NULL,
+    "idEvaluacion" bigint NOT NULL,
+    "resultado" smallint NOT NULL,
+    "observacion" "text"
+);
+
+
+ALTER TABLE "public"."Sesion_Evaluacion" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."Sesion_Evaluacion" ALTER COLUMN "idSesionEvaluacion" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."Sesion_Evaluacion_idSesionEvaluacion_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+ALTER TABLE "public"."Sesion" ALTER COLUMN "idSesion" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."Sesion_idSesion_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."Terminos_Condiciones" (
+    "idTerminosCondiciones" bigint NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "version" character varying NOT NULL,
+    "contenido" "text" NOT NULL,
+    "fecha_publicacion" timestamp without time zone NOT NULL,
+    "estado" "public"."estado_promocion" NOT NULL
+);
+
+
+ALTER TABLE "public"."Terminos_Condiciones" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."Terminos_Condiciones" ALTER COLUMN "idTerminosCondiciones" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."Terminos_Condiciones_idTerminosCondiciones_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."Tratamiento" (
+    "idTratamiento" bigint NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "idPaciente" "uuid" NOT NULL,
+    "idFisioterapeuta" "uuid" DEFAULT "auth"."uid"() NOT NULL,
+    "motivo_consulta" "text" NOT NULL,
+    "diagnostico" "text" NOT NULL,
+    "resultado" "text",
+    "estado" "public"."estado_Tratamiento" DEFAULT 'en_progreso'::"public"."estado_Tratamiento" NOT NULL,
+    "total_sesiones" smallint
+);
+
+
+ALTER TABLE "public"."Tratamiento" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."Tratamiento" ALTER COLUMN "idTratamiento" ADD GENERATED BY DEFAULT AS IDENTITY (
+    SEQUENCE NAME "public"."Tratamiento_idTratamiento_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE OR REPLACE VIEW "public"."v_saldo_paquete" AS
+SELECT
+    NULL::bigint AS "idPaquete",
+    NULL::"uuid" AS "idPaciente",
+    NULL::character varying AS "nombre_paquete",
+    NULL::integer AS "total_sesiones",
+    NULL::bigint AS "sesiones_consumidas",
+    NULL::bigint AS "sesiones_restantes",
+    NULL::"public"."estado_financiero_paquete" AS "estado_pago";
+
+
+ALTER VIEW "public"."v_saldo_paquete" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."vw_citas_detalladas" AS
+ SELECT "s"."idSesion",
+    "s"."created_at",
+    "s"."idTratamiento",
+    "s"."idFisioterapeuta",
+    "s"."numero_sesion",
+    "s"."fecha_hora",
+    "s"."notas_evolucion",
+    "s"."estado",
+    "s"."indicaciones",
+    "s"."expires_at",
+    "s"."observaciones",
+    "s"."idPaquete",
+    "s"."idSesionOriginal",
+    "s"."idPaciente",
+    "s"."tipo",
+    "s"."paciente_en_sala",
+    "s"."idServicio",
+    "s"."sesiones_a_generar",
+    "s"."estado_pago",
+    "s"."id_transaccion_referencia",
+    "f"."especialidad" AS "fisio_especialidad",
+    "per_p"."nombres" AS "paciente_nombres",
+    "per_p"."apellidos" AS "paciente_apellidos",
+    "per_f"."nombres" AS "fisio_nombres",
+    "per_f"."apellidos" AS "fisio_apellidos"
+   FROM (((("public"."Sesion" "s"
+     LEFT JOIN "public"."Fisioterapeuta" "f" ON (("s"."idFisioterapeuta" = "f"."idFisioterapeuta")))
+     LEFT JOIN "public"."Persona" "per_f" ON (("f"."idFisioterapeuta" = "per_f"."idPersona")))
+     LEFT JOIN "public"."Paciente" "p" ON (("s"."idPaciente" = "p"."idPaciente")))
+     LEFT JOIN "public"."Persona" "per_p" ON (("p"."idPaciente" = "per_p"."idPersona")));
+
+
+ALTER VIEW "public"."vw_citas_detalladas" OWNER TO "postgres";
+
+
+CREATE OR REPLACE VIEW "public"."vw_saldo_paciente" AS
+ SELECT "idPaciente",
+    "sum"("sesiones_disponibles") AS "total_disponible"
+   FROM "public"."Saldo_Sesiones"
+  GROUP BY "idPaciente";
+
+
+ALTER VIEW "public"."vw_saldo_paciente" OWNER TO "postgres";
+
+
+ALTER TABLE ONLY "public"."Antecedentes"
+    ADD CONSTRAINT "Antecedentes_idPaciente_unique" UNIQUE ("idPaciente");
+
+
+
+ALTER TABLE ONLY "public"."Antecedentes"
+    ADD CONSTRAINT "Antecedentes_pkey" PRIMARY KEY ("idAntecedentes");
+
+
+
+ALTER TABLE ONLY "public"."Catalogo_Servicio"
+    ADD CONSTRAINT "Catalogo_Servicio_pkey" PRIMARY KEY ("idServicio");
+
+
+
+ALTER TABLE ONLY "public"."Evaluacion"
+    ADD CONSTRAINT "Evaluacion_pkey" PRIMARY KEY ("idEvaluacion");
+
+
+
+ALTER TABLE ONLY "public"."Fisioterapeuta"
+    ADD CONSTRAINT "Fisioterapeuta_pkey" PRIMARY KEY ("idFisioterapeuta");
+
+
+
+ALTER TABLE ONLY "public"."Horario"
+    ADD CONSTRAINT "Horario_pkey" PRIMARY KEY ("idHorario");
+
+
+
+ALTER TABLE ONLY "public"."Paciente"
+    ADD CONSTRAINT "Paciente_pkey" PRIMARY KEY ("idPaciente");
+
+
+
+ALTER TABLE ONLY "public"."Persona"
+    ADD CONSTRAINT "Persona_numero_documento_key" UNIQUE ("numero_documento");
+
+
+
+ALTER TABLE ONLY "public"."Persona"
+    ADD CONSTRAINT "Persona_pkey" PRIMARY KEY ("idPersona");
+
+
+
+ALTER TABLE ONLY "public"."Promocion"
+    ADD CONSTRAINT "Promocion_pkey" PRIMARY KEY ("idPromocion");
+
+
+
+ALTER TABLE ONLY "public"."Saldo_Sesiones"
+    ADD CONSTRAINT "Saldo_Sesiones_pkey" PRIMARY KEY ("idSaldo");
+
+
+
+ALTER TABLE ONLY "public"."Sesion_Evaluacion"
+    ADD CONSTRAINT "Sesion_Evaluacion_pkey" PRIMARY KEY ("idSesionEvaluacion");
+
+
+
+ALTER TABLE ONLY "public"."Sesion"
+    ADD CONSTRAINT "Sesion_pkey" PRIMARY KEY ("idSesion");
+
+
+
+ALTER TABLE ONLY "public"."Terminos_Condiciones"
+    ADD CONSTRAINT "Terminos_Condiciones_pkey" PRIMARY KEY ("idTerminosCondiciones");
+
+
+
+ALTER TABLE ONLY "public"."Tratamiento"
+    ADD CONSTRAINT "Tratamiento_pkey" PRIMARY KEY ("idTratamiento");
+
+
+
+ALTER TABLE ONLY "public"."Evaluacion_inicial"
+    ADD CONSTRAINT "evaluacion_inicial_idSesion_key" UNIQUE ("idSesion");
+
+
+
+ALTER TABLE ONLY "public"."Evaluacion_inicial"
+    ADD CONSTRAINT "evaluacion_inicial_pkey" PRIMARY KEY ("idEvaluacionInicial");
+
+
+
+ALTER TABLE ONLY "public"."Historial_estado_sesion"
+    ADD CONSTRAINT "historial_estado_sesion_pkey" PRIMARY KEY ("idHistorial");
+
+
+
+ALTER TABLE ONLY "public"."Pago"
+    ADD CONSTRAINT "pago_pkey" PRIMARY KEY ("idPago");
+
+
+
+ALTER TABLE ONLY "public"."Paquete"
+    ADD CONSTRAINT "paquete_pkey" PRIMARY KEY ("idPaquete");
+
+
+
+ALTER TABLE ONLY "public"."Secretaria"
+    ADD CONSTRAINT "secretaria_pkey" PRIMARY KEY ("idSecretaria");
+
+
+
+CREATE OR REPLACE VIEW "public"."v_saldo_paquete" AS
+ SELECT "p"."idPaquete",
+    "p"."idPaciente",
+    "p"."nombre_paquete",
+    "p"."total_sesiones",
+    "count"("s"."idSesion") FILTER (WHERE ("s"."estado" <> ALL (ARRAY['cancelada'::"public"."estado_sesion", 'reprogramada'::"public"."estado_sesion"]))) AS "sesiones_consumidas",
+    ("p"."total_sesiones" - "count"("s"."idSesion") FILTER (WHERE ("s"."estado" <> ALL (ARRAY['cancelada'::"public"."estado_sesion", 'reprogramada'::"public"."estado_sesion"])))) AS "sesiones_restantes",
+    "p"."estado_pago"
+   FROM ("public"."Paquete" "p"
+     LEFT JOIN "public"."Sesion" "s" ON (("s"."idPaquete" = "p"."idPaquete")))
+  GROUP BY "p"."idPaquete";
+
+
+
+CREATE OR REPLACE TRIGGER "trg_abono_sesiones" AFTER INSERT ON "public"."Sesion" FOR EACH ROW EXECUTE FUNCTION "public"."fn_gestion_sesiones_inteligente"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_descuento_sesiones" AFTER UPDATE ON "public"."Sesion" FOR EACH ROW EXECUTE FUNCTION "public"."fn_gestion_sesiones_inteligente"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_gestionar_sesiones" AFTER UPDATE ON "public"."Sesion" FOR EACH ROW EXECUTE FUNCTION "public"."fn_gestionar_sesiones_atencion"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_validar_fecha_cita" BEFORE INSERT OR UPDATE ON "public"."Sesion" FOR EACH ROW EXECUTE FUNCTION "public"."validar_fecha_cita_futura"();
+
+
+
+CREATE OR REPLACE TRIGGER "trigger_actualizar_finanzas_paquete" AFTER INSERT OR UPDATE OF "monto" ON "public"."Pago" FOR EACH ROW WHEN (("new"."idPaquete" IS NOT NULL)) EXECUTE FUNCTION "public"."registrar_estado_financiero_paquete"();
+
+
+
+CREATE OR REPLACE TRIGGER "trigger_guardián_estados_sesion" BEFORE UPDATE ON "public"."Sesion" FOR EACH ROW EXECUTE FUNCTION "public"."validar_transicion_estado_sesion"();
+
+
+
+ALTER TABLE ONLY "public"."Antecedentes"
+    ADD CONSTRAINT "Antecedentes_idPaciente_fkey" FOREIGN KEY ("idPaciente") REFERENCES "public"."Paciente"("idPaciente") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Evaluacion_inicial"
+    ADD CONSTRAINT "Eval_idTratamiento_fkey" FOREIGN KEY ("idTratamiento") REFERENCES "public"."Tratamiento"("idTratamiento") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."Evaluacion_inicial"
+    ADD CONSTRAINT "Evaluacion_inicial_idSesion_fkey" FOREIGN KEY ("idSesion") REFERENCES "public"."Sesion"("idSesion") ON UPDATE CASCADE ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."Fisioterapeuta"
+    ADD CONSTRAINT "Fisioterapeuta_idFisioterapeuta_fkey" FOREIGN KEY ("idFisioterapeuta") REFERENCES "public"."Persona"("idPersona");
+
+
+
+ALTER TABLE ONLY "public"."Horario"
+    ADD CONSTRAINT "Horario_idFisioterapeuta_fkey" FOREIGN KEY ("idFisioterapeuta") REFERENCES "public"."Fisioterapeuta"("idFisioterapeuta") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Paciente"
+    ADD CONSTRAINT "Paciente_idPaciente_fkey" FOREIGN KEY ("idPaciente") REFERENCES "public"."Persona"("idPersona") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Pago"
+    ADD CONSTRAINT "Pago_idPromocion_fkey" FOREIGN KEY ("idPromocion") REFERENCES "public"."Promocion"("idPromocion") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Paquete"
+    ADD CONSTRAINT "Paquete_idPromocion_fkey" FOREIGN KEY ("idPromocion") REFERENCES "public"."Promocion"("idPromocion") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Persona"
+    ADD CONSTRAINT "Persona_idPersona_fkey" FOREIGN KEY ("idPersona") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Saldo_Sesiones"
+    ADD CONSTRAINT "Saldo_Sesiones_idPaciente_fkey" FOREIGN KEY ("idPaciente") REFERENCES "public"."Paciente"("idPaciente") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Sesion_Evaluacion"
+    ADD CONSTRAINT "Sesion_Evaluacion_idEvaluacion_fkey" FOREIGN KEY ("idEvaluacion") REFERENCES "public"."Evaluacion"("idEvaluacion") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Sesion_Evaluacion"
+    ADD CONSTRAINT "Sesion_Evaluacion_idSesion_fkey" FOREIGN KEY ("idSesion") REFERENCES "public"."Sesion"("idSesion") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Sesion"
+    ADD CONSTRAINT "Sesion_idFisioterapeuta_fkey" FOREIGN KEY ("idFisioterapeuta") REFERENCES "public"."Fisioterapeuta"("idFisioterapeuta") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Sesion"
+    ADD CONSTRAINT "Sesion_idPaciente_fkey" FOREIGN KEY ("idPaciente") REFERENCES "public"."Paciente"("idPaciente") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Sesion"
+    ADD CONSTRAINT "Sesion_idPaquete_fkey" FOREIGN KEY ("idPaquete") REFERENCES "public"."Paquete"("idPaquete") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."Sesion"
+    ADD CONSTRAINT "Sesion_idSesionOriginal_fkey" FOREIGN KEY ("idSesionOriginal") REFERENCES "public"."Sesion"("idSesion") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."Sesion"
+    ADD CONSTRAINT "Sesion_idTratamiento_fkey" FOREIGN KEY ("idTratamiento") REFERENCES "public"."Tratamiento"("idTratamiento") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Tratamiento"
+    ADD CONSTRAINT "Tratamiento_idFisioterapeuta_fkey" FOREIGN KEY ("idFisioterapeuta") REFERENCES "public"."Fisioterapeuta"("idFisioterapeuta") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Tratamiento"
+    ADD CONSTRAINT "Tratamiento_idPaciente_fkey" FOREIGN KEY ("idPaciente") REFERENCES "public"."Paciente"("idPaciente") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Evaluacion_inicial"
+    ADD CONSTRAINT "eval_idfisioterapeuta_fkey" FOREIGN KEY ("idFisioterapeuta") REFERENCES "public"."Fisioterapeuta"("idFisioterapeuta") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Evaluacion_inicial"
+    ADD CONSTRAINT "eval_idpaciente_fkey" FOREIGN KEY ("idPaciente") REFERENCES "public"."Paciente"("idPaciente") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Historial_estado_sesion"
+    ADD CONSTRAINT "historial_idsesion_fkey" FOREIGN KEY ("idSesion") REFERENCES "public"."Sesion"("idSesion") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Pago"
+    ADD CONSTRAINT "pago_idpaciente_fkey" FOREIGN KEY ("idPaciente") REFERENCES "public"."Paciente"("idPaciente") ON DELETE RESTRICT;
+
+
+
+ALTER TABLE ONLY "public"."Pago"
+    ADD CONSTRAINT "pago_idpaquete_fkey" FOREIGN KEY ("idPaquete") REFERENCES "public"."Paquete"("idPaquete") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."Pago"
+    ADD CONSTRAINT "pago_idsesion_fkey" FOREIGN KEY ("idSesion") REFERENCES "public"."Sesion"("idSesion") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."Paquete"
+    ADD CONSTRAINT "paquete_idpaciente_fkey" FOREIGN KEY ("idPaciente") REFERENCES "public"."Paciente"("idPaciente") ON DELETE RESTRICT;
+
+
+
+ALTER TABLE ONLY "public"."Paquete"
+    ADD CONSTRAINT "paquete_idservicio_fkey" FOREIGN KEY ("idServicio") REFERENCES "public"."Catalogo_Servicio"("idServicio") ON UPDATE CASCADE ON DELETE RESTRICT;
+
+
+
+ALTER TABLE ONLY "public"."Secretaria"
+    ADD CONSTRAINT "secretaria_idsecretaria_fkey" FOREIGN KEY ("idSecretaria") REFERENCES "public"."Persona"("idPersona") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."Sesion"
+    ADD CONSTRAINT "sesion_idservicio_fkey" FOREIGN KEY ("idServicio") REFERENCES "public"."Catalogo_Servicio"("idServicio") ON UPDATE CASCADE ON DELETE RESTRICT;
+
+
+
+CREATE POLICY "Admin_All_Catalogo" ON "public"."Catalogo_Servicio" TO "authenticated" USING (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'admin'::"text"));
+
+
+
+ALTER TABLE "public"."Antecedentes" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Auto-gestión o Control de Admin" ON "public"."Persona" FOR UPDATE TO "authenticated" USING ((("auth"."uid"() = "idPersona") OR ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'admin'::"text"))) WITH CHECK ((("auth"."uid"() = "idPersona") OR ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'admin'::"text")));
+
+
+
+ALTER TABLE "public"."Catalogo_Servicio" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Eval_Ini_All_Policy" ON "public"."Evaluacion_inicial" TO "authenticated" USING (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['fisioterapeuta'::"text", 'admin'::"text"]))) WITH CHECK (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['fisioterapeuta'::"text", 'admin'::"text"])));
+
+
+
+CREATE POLICY "Eval_Ini_Select_Policy" ON "public"."Evaluacion_inicial" FOR SELECT TO "authenticated" USING ((("auth"."uid"() = "idPaciente") OR ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['fisioterapeuta'::"text", 'admin'::"text", 'secretaria'::"text"]))));
+
+
+
+ALTER TABLE "public"."Evaluacion" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Evaluacion_Admin_Policy" ON "public"."Evaluacion" TO "authenticated" USING (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'admin'::"text")) WITH CHECK (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'admin'::"text"));
+
+
+
+CREATE POLICY "Evaluacion_Select_Policy" ON "public"."Evaluacion" FOR SELECT TO "authenticated" USING (true);
+
+
+
+ALTER TABLE "public"."Evaluacion_inicial" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Fisio_Select_Policy" ON "public"."Fisioterapeuta" FOR SELECT TO "authenticated" USING (true);
+
+
+
+CREATE POLICY "Fisio_Write_Policy" ON "public"."Fisioterapeuta" TO "authenticated" USING (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'admin'::"text")) WITH CHECK (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'admin'::"text"));
+
+
+
+ALTER TABLE "public"."Fisioterapeuta" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Historial_Select_Policy" ON "public"."Historial_estado_sesion" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'fisioterapeuta'::"text", 'admin'::"text"])));
+
+
+
+ALTER TABLE "public"."Historial_estado_sesion" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."Horario" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Horario_All_Policy" ON "public"."Horario" TO "authenticated" USING ((("auth"."uid"() = "idFisioterapeuta") AND ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['fisioterapeuta'::"text", 'admin'::"text"])))) WITH CHECK ((("auth"."uid"() = "idFisioterapeuta") AND ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['fisioterapeuta'::"text", 'admin'::"text"]))));
+
+
+
+CREATE POLICY "Horario_Select_Policy" ON "public"."Horario" FOR SELECT TO "authenticated" USING (true);
+
+
+
+ALTER TABLE "public"."Paciente" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Paciente_Select_Policy" ON "public"."Paciente" FOR SELECT TO "authenticated" USING ((("auth"."uid"() = "idPaciente") OR ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'fisioterapeuta'::"text", 'admin'::"text"]))));
+
+
+
+CREATE POLICY "Paciente_Write_Policy" ON "public"."Paciente" TO "authenticated" USING (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'admin'::"text", 'paciente'::"text"]))) WITH CHECK (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'admin'::"text", 'paciente'::"text"])));
+
+
+
+ALTER TABLE "public"."Pago" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Pago_Insert_Policy" ON "public"."Pago" FOR INSERT TO "authenticated" WITH CHECK (((((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'paciente'::"text") AND ("auth"."uid"() = "idPaciente")) OR ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'admin'::"text"]))));
+
+
+
+CREATE POLICY "Pago_Select_Policy" ON "public"."Pago" FOR SELECT TO "authenticated" USING ((("auth"."uid"() = "idPaciente") OR ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'admin'::"text"]))));
+
+
+
+ALTER TABLE "public"."Paquete" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Paquete_Select_Policy" ON "public"."Paquete" FOR SELECT TO "authenticated" USING ((("auth"."uid"() = "idPaciente") OR ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'admin'::"text", 'fisioterapeuta'::"text"]))));
+
+
+
+CREATE POLICY "Paquete_Write_Policy" ON "public"."Paquete" TO "authenticated" USING (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'admin'::"text"]))) WITH CHECK (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'admin'::"text"])));
+
+
+
+CREATE POLICY "Permitir borrado a personal autorizado" ON "public"."Persona" FOR DELETE TO "authenticated" USING (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['admin'::"text", 'secretaria'::"text"])));
+
+
+
+CREATE POLICY "Permitir gestión total de antecedentes al staff autenticado" ON "public"."Antecedentes" TO "authenticated" USING (true) WITH CHECK (true);
+
+
+
+ALTER TABLE "public"."Persona" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Persona_Insert_Policy" ON "public"."Persona" FOR INSERT TO "authenticated" WITH CHECK (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'admin'::"text", 'paciente'::"text"])));
+
+
+
+CREATE POLICY "Persona_Select_Policy" ON "public"."Persona" FOR SELECT TO "authenticated" USING ((("auth"."uid"() = "idPersona") OR ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'fisioterapeuta'::"text", 'admin'::"text"]))));
+
+
+
+CREATE POLICY "Persona_Update_Policy" ON "public"."Persona" FOR UPDATE TO "authenticated" USING ((("auth"."uid"() = "idPersona") OR ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'admin'::"text"]))));
+
+
+
+ALTER TABLE "public"."Promocion" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Promocion_Admin_Policy" ON "public"."Promocion" TO "authenticated" USING (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'admin'::"text")) WITH CHECK (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'admin'::"text"));
+
+
+
+CREATE POLICY "Promocion_Select_Policy" ON "public"."Promocion" FOR SELECT TO "authenticated" USING (true);
+
+
+
+ALTER TABLE "public"."Saldo_Sesiones" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."Secretaria" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Seguridad Absoluta: Solo el Admin Real inserta secretarias" ON "public"."Secretaria" FOR INSERT TO "authenticated" WITH CHECK ((EXISTS ( SELECT 1
+   FROM "public"."Persona"
+  WHERE (("Persona"."idPersona" = "auth"."uid"()) AND ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'admin'::"text")))));
+
+
+
+ALTER TABLE "public"."Sesion" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Sesion_Eval_All_Policy" ON "public"."Sesion_Evaluacion" TO "authenticated" USING (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['fisioterapeuta'::"text", 'admin'::"text"]))) WITH CHECK (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['fisioterapeuta'::"text", 'admin'::"text"])));
+
+
+
+CREATE POLICY "Sesion_Eval_Select_Policy" ON "public"."Sesion_Evaluacion" FOR SELECT TO "authenticated" USING ((((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['fisioterapeuta'::"text", 'admin'::"text", 'secretaria'::"text"])) OR (EXISTS ( SELECT 1
+   FROM "public"."Sesion" "s"
+  WHERE (("s"."idSesion" = "s"."idSesion") AND ("s"."idPaciente" = "auth"."uid"()))))));
+
+
+
+ALTER TABLE "public"."Sesion_Evaluacion" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Sesion_Insert_Policy" ON "public"."Sesion" FOR INSERT TO "authenticated" WITH CHECK (((((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'paciente'::"text") AND ("auth"."uid"() = "idPaciente")) OR ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'admin'::"text"]))));
+
+
+
+CREATE POLICY "Sesion_Select_Policy" ON "public"."Sesion" FOR SELECT TO "authenticated" USING ((("auth"."uid"() = "idPaciente") OR (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'fisioterapeuta'::"text") AND ("auth"."uid"() = "idFisioterapeuta")) OR ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['admin'::"text", 'secretaria'::"text"]))));
+
+
+
+CREATE POLICY "Sesion_Update_Policy" ON "public"."Sesion" FOR UPDATE TO "authenticated" USING ((((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'admin'::"text"])) OR (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'fisioterapeuta'::"text") AND ("auth"."uid"() = "idFisioterapeuta"))));
+
+
+
+CREATE POLICY "Solo Admin puede insertar o modificar secretarias" ON "public"."Secretaria" TO "authenticated" USING (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'admin'::"text")) WITH CHECK (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'admin'::"text"));
+
+
+
+CREATE POLICY "Staff y Admin pueden leer datos de secretarias" ON "public"."Secretaria" FOR SELECT TO "authenticated" USING (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['secretaria'::"text", 'admin'::"text", 'fisioterapeuta'::"text"])));
+
+
+
+CREATE POLICY "Staff_Select_Catalogo" ON "public"."Catalogo_Servicio" FOR SELECT TO "authenticated" USING (true);
+
+
+
+CREATE POLICY "Terminos_Admin_Policy" ON "public"."Terminos_Condiciones" TO "authenticated" USING (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'admin'::"text")) WITH CHECK (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = 'admin'::"text"));
+
+
+
+ALTER TABLE "public"."Terminos_Condiciones" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Terminos_Select_Policy" ON "public"."Terminos_Condiciones" FOR SELECT TO "authenticated" USING (true);
+
+
+
+ALTER TABLE "public"."Tratamiento" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "Tratamiento_All_Policy" ON "public"."Tratamiento" TO "authenticated" USING (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['fisioterapeuta'::"text", 'admin'::"text"]))) WITH CHECK (((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['fisioterapeuta'::"text", 'admin'::"text"])));
+
+
+
+CREATE POLICY "Tratamiento_Select_Policy" ON "public"."Tratamiento" FOR SELECT TO "authenticated" USING ((("auth"."uid"() = "idPaciente") OR ((("auth"."jwt"() -> 'user_metadata'::"text") ->> 'rol'::"text") = ANY (ARRAY['fisioterapeuta'::"text", 'admin'::"text", 'secretaria'::"text"]))));
+
+
+
+CREATE POLICY "public can read persons" ON "public"."Persona" FOR SELECT TO "authenticated" USING (true);
+
+
+
+
+
+ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
+
+
+
+
+
+GRANT USAGE ON SCHEMA "public" TO "postgres";
+GRANT USAGE ON SCHEMA "public" TO "anon";
+GRANT USAGE ON SCHEMA "public" TO "authenticated";
+GRANT USAGE ON SCHEMA "public" TO "service_role";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+GRANT ALL ON FUNCTION "public"."crear_sesiones_futuras"("p_id_tratamiento" bigint, "p_id_fisioterapeuta" "uuid", "p_id_paciente" "uuid", "p_total_sesiones" smallint, "p_fecha_primera" timestamp with time zone, "p_intervalo_dias" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."crear_sesiones_futuras"("p_id_tratamiento" bigint, "p_id_fisioterapeuta" "uuid", "p_id_paciente" "uuid", "p_total_sesiones" smallint, "p_fecha_primera" timestamp with time zone, "p_intervalo_dias" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."crear_sesiones_futuras"("p_id_tratamiento" bigint, "p_id_fisioterapeuta" "uuid", "p_id_paciente" "uuid", "p_total_sesiones" smallint, "p_fecha_primera" timestamp with time zone, "p_intervalo_dias" integer) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."fn_gestion_sesiones_inteligente"() TO "anon";
+GRANT ALL ON FUNCTION "public"."fn_gestion_sesiones_inteligente"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."fn_gestion_sesiones_inteligente"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."fn_gestionar_sesiones_atencion"() TO "anon";
+GRANT ALL ON FUNCTION "public"."fn_gestionar_sesiones_atencion"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."fn_gestionar_sesiones_atencion"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."get_my_rol"() TO "anon";
+GRANT ALL ON FUNCTION "public"."get_my_rol"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_my_rol"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."handle_new_user"() TO "anon";
+GRANT ALL ON FUNCTION "public"."handle_new_user"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."handle_new_user"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."registrar_estado_financiero_paquete"() TO "anon";
+GRANT ALL ON FUNCTION "public"."registrar_estado_financiero_paquete"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."registrar_estado_financiero_paquete"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."validar_fecha_cita_futura"() TO "anon";
+GRANT ALL ON FUNCTION "public"."validar_fecha_cita_futura"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."validar_fecha_cita_futura"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."validar_transicion_estado_sesion"() TO "anon";
+GRANT ALL ON FUNCTION "public"."validar_transicion_estado_sesion"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."validar_transicion_estado_sesion"() TO "service_role";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+GRANT ALL ON TABLE "public"."Antecedentes" TO "anon";
+GRANT ALL ON TABLE "public"."Antecedentes" TO "authenticated";
+GRANT ALL ON TABLE "public"."Antecedentes" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."Antecedentes_idAntecedentes_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."Antecedentes_idAntecedentes_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."Antecedentes_idAntecedentes_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Catalogo_Servicio" TO "anon";
+GRANT ALL ON TABLE "public"."Catalogo_Servicio" TO "authenticated";
+GRANT ALL ON TABLE "public"."Catalogo_Servicio" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."Catalogo_Servicio_idServicio_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."Catalogo_Servicio_idServicio_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."Catalogo_Servicio_idServicio_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Evaluacion" TO "anon";
+GRANT ALL ON TABLE "public"."Evaluacion" TO "authenticated";
+GRANT ALL ON TABLE "public"."Evaluacion" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."Evaluacion_idEvaluacion_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."Evaluacion_idEvaluacion_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."Evaluacion_idEvaluacion_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Evaluacion_inicial" TO "anon";
+GRANT ALL ON TABLE "public"."Evaluacion_inicial" TO "authenticated";
+GRANT ALL ON TABLE "public"."Evaluacion_inicial" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."Evaluacion_inicial_idEvaluacionInicial_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."Evaluacion_inicial_idEvaluacionInicial_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."Evaluacion_inicial_idEvaluacionInicial_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Fisioterapeuta" TO "anon";
+GRANT ALL ON TABLE "public"."Fisioterapeuta" TO "authenticated";
+GRANT ALL ON TABLE "public"."Fisioterapeuta" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Historial_estado_sesion" TO "anon";
+GRANT ALL ON TABLE "public"."Historial_estado_sesion" TO "authenticated";
+GRANT ALL ON TABLE "public"."Historial_estado_sesion" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."Historial_estado_sesion_idHistorial_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."Historial_estado_sesion_idHistorial_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."Historial_estado_sesion_idHistorial_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Horario" TO "anon";
+GRANT ALL ON TABLE "public"."Horario" TO "authenticated";
+GRANT ALL ON TABLE "public"."Horario" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."Horario_idHorario_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."Horario_idHorario_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."Horario_idHorario_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Paciente" TO "anon";
+GRANT ALL ON TABLE "public"."Paciente" TO "authenticated";
+GRANT ALL ON TABLE "public"."Paciente" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Pago" TO "anon";
+GRANT ALL ON TABLE "public"."Pago" TO "authenticated";
+GRANT ALL ON TABLE "public"."Pago" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."Pago_idPago_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."Pago_idPago_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."Pago_idPago_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Paquete" TO "anon";
+GRANT ALL ON TABLE "public"."Paquete" TO "authenticated";
+GRANT ALL ON TABLE "public"."Paquete" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."Paquete_idPaquete_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."Paquete_idPaquete_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."Paquete_idPaquete_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Persona" TO "anon";
+GRANT ALL ON TABLE "public"."Persona" TO "authenticated";
+GRANT ALL ON TABLE "public"."Persona" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Promocion" TO "anon";
+GRANT ALL ON TABLE "public"."Promocion" TO "authenticated";
+GRANT ALL ON TABLE "public"."Promocion" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."Promocion_idPromocion_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."Promocion_idPromocion_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."Promocion_idPromocion_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Saldo_Sesiones" TO "anon";
+GRANT ALL ON TABLE "public"."Saldo_Sesiones" TO "authenticated";
+GRANT ALL ON TABLE "public"."Saldo_Sesiones" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."Saldo_Sesiones_idSaldo_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."Saldo_Sesiones_idSaldo_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."Saldo_Sesiones_idSaldo_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Secretaria" TO "anon";
+GRANT ALL ON TABLE "public"."Secretaria" TO "authenticated";
+GRANT ALL ON TABLE "public"."Secretaria" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Sesion" TO "anon";
+GRANT ALL ON TABLE "public"."Sesion" TO "authenticated";
+GRANT ALL ON TABLE "public"."Sesion" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Sesion_Evaluacion" TO "anon";
+GRANT ALL ON TABLE "public"."Sesion_Evaluacion" TO "authenticated";
+GRANT ALL ON TABLE "public"."Sesion_Evaluacion" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."Sesion_Evaluacion_idSesionEvaluacion_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."Sesion_Evaluacion_idSesionEvaluacion_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."Sesion_Evaluacion_idSesionEvaluacion_seq" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."Sesion_idSesion_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."Sesion_idSesion_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."Sesion_idSesion_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Terminos_Condiciones" TO "anon";
+GRANT ALL ON TABLE "public"."Terminos_Condiciones" TO "authenticated";
+GRANT ALL ON TABLE "public"."Terminos_Condiciones" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."Terminos_Condiciones_idTerminosCondiciones_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."Terminos_Condiciones_idTerminosCondiciones_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."Terminos_Condiciones_idTerminosCondiciones_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."Tratamiento" TO "anon";
+GRANT ALL ON TABLE "public"."Tratamiento" TO "authenticated";
+GRANT ALL ON TABLE "public"."Tratamiento" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."Tratamiento_idTratamiento_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."Tratamiento_idTratamiento_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."Tratamiento_idTratamiento_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."v_saldo_paquete" TO "anon";
+GRANT ALL ON TABLE "public"."v_saldo_paquete" TO "authenticated";
+GRANT ALL ON TABLE "public"."v_saldo_paquete" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."vw_citas_detalladas" TO "anon";
+GRANT ALL ON TABLE "public"."vw_citas_detalladas" TO "authenticated";
+GRANT ALL ON TABLE "public"."vw_citas_detalladas" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."vw_saldo_paciente" TO "anon";
+GRANT ALL ON TABLE "public"."vw_saldo_paciente" TO "authenticated";
+GRANT ALL ON TABLE "public"."vw_saldo_paciente" TO "service_role";
+
+
+
+
+
+
+
+
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "postgres";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "anon";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "authenticated";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "service_role";
+
+
+
+
+
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS TO "postgres";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS TO "anon";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS TO "authenticated";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS TO "service_role";
+
+
+
+
+
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "postgres";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "anon";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "authenticated";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "service_role";
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+drop extension if exists "pg_net";
+
+alter table "public"."Catalogo_Servicio" drop constraint "Catalogo_Servicio_tipo_check";
+
+alter table "public"."Catalogo_Servicio" add constraint "Catalogo_Servicio_tipo_check" CHECK (((tipo)::text = ANY ((ARRAY['sesion_suelta'::character varying, 'paquete'::character varying])::text[]))) not valid;
+
+alter table "public"."Catalogo_Servicio" validate constraint "Catalogo_Servicio_tipo_check";
+
+CREATE TRIGGER on_auth_user_created AFTER INSERT ON auth.users FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+</database_schema>
+
+<frontend_composables>
+--- useCitas.js ---
+/**
+ * useCitas.js — v3 (definitivo)
+ *
+ * CORRECCIONES RESPECTO A v2:
+ * ─────────────────────────────────────────────────────────────────────────────
+ * [E1] crearCita modalidad 'evaluacion_paquete':
+ * Eliminado el flujo de Catalogo_Servicio (tabla inexistente).
+ * Ahora selecciona un Paquete ya existente del paciente desde v_saldo_paquete.
+ * El INSERT en Sesion vincula idPaquete directamente.
+ *
+ * [E2] numero_sesion: 0 → 1 (el CHECK de la BD exige >= 1)
+ *
+ * [E3] Falta el campo `tipo` (NOT NULL) en el INSERT de Sesion.
+ * Se envía tipo: 'evaluacion' siempre al crear la cita inicial.
+ *
+ * [E4] fetchPaquetesPaciente usa la vista v_saldo_paquete correctamente,
+ * filtrando por paciente y solo paquetes con saldo > 0.
+ *
+ * [E5] verificarDisponibilidad: sintaxis .not() de supabase corregida.
+ * La forma correcta es .not('estado', 'in', '(cancelada,reprogramada,no_asistio)')
+ * sin comillas dobles dentro del paréntesis.
+ *
+ * [E6] fetchPaquetesCatalogo eliminada (consultaba Catalogo_Servicio, tabla inexistente).
+ *
+ * ESTRUCTURA DEL FLUJO 'evaluacion_paquete':
+ * 1. Al seleccionar paciente → fetchPaquetesPaciente carga sus paquetes con saldo
+ * 2. La secretaria elige uno de esos paquetes en el modal
+ * 3. crearCita inserta la Sesion con ese idPaquete ya existente
+ * 4. El trigger de la BD actualiza el saldo del paquete automáticamente
+ */
+
+import { ref, computed } from 'vue'
+import { supabase } from '@/lib/supabaseClient'
+import { useAlert } from '@/composables/useAlert'
+
+// ─── Constantes de negocio ────────────────────────────────────────────────────
+export const MODALIDADES = [
+    {
+        id: 'solo_evaluacion',
+        label: 'Solo Evaluación Inicial',
+        descripcion: 'Consulta diagnóstica gratuita. No genera sesiones adicionales.',
+        icono: '🔍',
+        color: '#4a90c4',
+    },
+    {
+        id: 'evaluacion_sesion',
+        label: 'Evaluación + 1 Sesión',
+        descripcion: 'Evaluación inicial más una sesión de tratamiento adicional.',
+        icono: '📋',
+        color: '#1a3a6e',
+    },
+    {
+        id: 'evaluacion_paquete',
+        label: 'Evaluación + Paquete',
+        descripcion: 'Evaluación inicial vinculada a un paquete prepagado del paciente.',
+        icono: '📦',
+        color: '#0f766e',
+    },
+    {
+        id: 'evaluacion_sesiones_libres',
+        label: 'Evaluación + Sesiones a Definir',
+        descripcion: 'Evaluación inicial; las sesiones se agendan individualmente según evolución.',
+        icono: '🗓️',
+        color: '#7c3aed',
+    },
+    {
+        id: 'sesion_tratamiento',
+        label: 'Sesión de Tratamiento',
+        descripcion: 'Sesión de fisioterapia regular (60 min).',
+        icono: '💆',
+        color: '#0ea5e9',
+    }
+]
+
+export const ESTADOS_SESION = {
+    reservada: { label: 'Reservada', color: '#f59e0b', bg: '#fef3c7' },
+    agendada: { label: 'Agendada', color: '#10b981', bg: '#d1fae5' },
+    atendida: { label: 'Atendida', color: '#3b82f6', bg: '#dbeafe' },
+    cancelada: { label: 'Cancelada', color: '#ef4444', bg: '#fee2e2' },
+    no_asistio: { label: 'No asistió', color: '#6b7280', bg: '#f3f4f6' },
+    reprogramada: { label: 'Reprogramada', color: '#8b5cf6', bg: '#ede9fe' },
+    pendiente: { label: 'Pendiente', color: '#f59e0b', bg: '#fef3c7' },
+    confirmada: { label: 'Confirmada', color: '#10b981', bg: '#d1fae5' },
+    pendiente_pago: { label: 'Pend. Pago', color: '#f97316', bg: '#ffedd5' },
+}
+
+// ─── Composable ───────────────────────────────────────────────────────────────
+export function useCitas() {
+    const { showAlert } = useAlert()
+
+    // ── Estado ──────────────────────────────────────────────────────────────────
+    const citas = ref([])
+    const fisios = ref([])
+    const pacientes = ref([])
+    const paquetes = ref([])   // paquetes CON SALDO del paciente seleccionado
+    const horarios = ref([])
+    const loading = ref(false)
+    const loadingAccion = ref(false)
+
+    const userRole = ref(null)
+    const userId = ref(null)
+
+    // ── Computed de rol ─────────────────────────────────────────────────────────
+    const esFisioterapeuta = computed(() => userRole.value === 'fisioterapeuta')
+    const esSecretaria = computed(() => userRole.value === 'secretaria')
+    const esPaciente = computed(() => userRole.value === 'paciente')
+    const esAdmin = computed(() => userRole.value === 'admin')
+    const puedeGestionar = computed(() => esSecretaria.value || esAdmin.value)
+
+    // ── initUser ────────────────────────────────────────────────────────────────
+    const initUser = async () => {
+        const { data: { user } } = await supabase.auth.getUser()
+        if (user) {
+            userRole.value = user.user_metadata?.rol || 'paciente'
+            userId.value = user.id
+        } else {
+            // Manejo explícito de error si no hay sesión
+            userId.value = null
+            throw new Error('No hay sesión de usuario activa')
+        }
+    }
+
+    // ── fetchCitas ──────────────────────────────────────────────────────────────
+    const fetchCitas = async (filtros = {}) => {
+        // ✅ CORRECCIÓN CRÍTICA: Validar userId antes de consultar
+        if (!userId.value) {
+            await initUser()
+        }
+
+        // Validación adicional: Si sigue sin userId después de initUser, abortar
+        if (!userId.value && (esPaciente.value || esFisioterapeuta.value)) {
+            showAlert('Error: Usuario no autenticado. Por favor, inicia sesión nuevamente.', 'error')
+            loading.value = false
+            return
+        }
+
+        loading.value = true
+        try {
+            // Consultamos la vista unificada
+            let query = supabase.from('vw_citas_detalladas').select(`
+            *,
+            Fisioterapeuta (
+                idFisioterapeuta, especialidad,
+                Persona (nombres, apellidos)
+            ),
+            Paciente (
+                idPaciente,
+                Persona (nombres, apellidos, celular)
+            )
+        `)
+
+            // ✅ SEGURIDAD: Solo filtrar por userId si está confirmado
+            if (esPaciente.value && userId.value) {
+                query = query.eq('idPaciente', userId.value)
+            } else if (esFisioterapeuta.value && userId.value) {
+                query = query.eq('idFisioterapeuta', userId.value)
+            }
+
+            if (filtros.rangoInicio && filtros.rangoFin) {
+                query = query.gte('fecha_hora', filtros.rangoInicio).lte('fecha_hora', filtros.rangoFin)
+            } else if (filtros.fecha) {
+                // ✅ CORRECCIÓN: Usamos -05:00 (Hora de Perú) en lugar de +00:00
+                const inicio = `${filtros.fecha}T00:00:00-05:00`
+                const fin = `${filtros.fecha}T23:59:59-05:00`
+                query = query.gte('fecha_hora', inicio).lte('fecha_hora', fin)
+            }
+
+            if (filtros.estado) query = query.eq('estado', filtros.estado)
+            if (filtros.idFisioterapeuta) query = query.eq('idFisioterapeuta', filtros.idFisioterapeuta)
+
+            const { data, error } = await query.order('fecha_hora', { ascending: true })
+            if (error) throw error
+            citas.value = data ?? []
+        } catch (err) {
+            showAlert('Error al cargar citas: ' + err.message, 'error')
+        } finally {
+            loading.value = false
+        }
+    }
+
+    // ── fetchFisios ─────────────────────────────────────────────────────────────
+    const fetchFisios = async () => {
+        const { data, error } = await supabase
+            .from('Fisioterapeuta')
+            .select(`
+        idFisioterapeuta,
+        especialidad,
+        Persona ( nombres, apellidos )
+      `)
+        if (error) { showAlert('Error al cargar fisioterapeutas: ' + error.message, 'error'); return }
+        fisios.value = data ?? []
+    }
+
+    // ── fetchPacientes ──────────────────────────────────────────────────────────
+    const fetchPacientes = async () => {
+        const { data, error } = await supabase
+            .from('Paciente')
+            .select(`
+        idPaciente,
+        Persona ( nombres, apellidos, celular, numero_documento )
+      `)
+        if (error) { showAlert('Error al cargar pacientes: ' + error.message, 'error'); return }
+        pacientes.value = data ?? []
+    }
+
+    // ── fetchPaquetesPaciente ───────────────────────────────────────────────────
+    const fetchPaquetesPaciente = async (idPaciente) => {
+        if (!idPaciente) { paquetes.value = []; return }
+        try {
+            const { data, error } = await supabase
+                .from('v_saldo_paquete')
+                .select('idPaquete, nombre_paquete, total_sesiones, sesiones_consumidas, sesiones_restantes, estado_pago')
+                .eq('idPaciente', idPaciente)
+                .gt('sesiones_restantes', 0)
+                .order('idPaquete', { ascending: false })
+
+            if (error) throw error
+            paquetes.value = data ?? []
+        } catch (err) {
+            showAlert('Error al cargar paquetes del paciente: ' + err.message, 'error')
+        }
+    }
+
+    // ── fetchHorarioFisio ───────────────────────────────────────────────────────
+    const fetchHorarioFisio = async (idFisioterapeuta) => {
+        if (!idFisioterapeuta) { horarios.value = []; return }
+        const { data, error } = await supabase
+            .from('Horario')
+            .select('dia_semana, hora_inicio, hora_fin')
+            .eq('idFisioterapeuta', idFisioterapeuta)
+        if (error) { showAlert('Error al cargar horario: ' + error.message, 'error'); return }
+        horarios.value = data ?? []
+    }
+
+    // ── obtenerSlotsDisponibles ─────────────────────────────────────────────────
+    const obtenerSlotsDisponibles = async (idFisioterapeuta, fechaSeleccionada, duracionMinutos) => {
+        if (!idFisioterapeuta || !fechaSeleccionada) return []
+
+        const [yyyy, mm, dd] = fechaSeleccionada.split('-')
+        const fechaLocal = new Date(yyyy, mm - 1, dd)
+        let diaSemana = fechaLocal.getDay()
+        diaSemana = diaSemana === 0 ? 7 : diaSemana
+
+        const { data: horariosFisio } = await supabase
+            .from('Horario')
+            .select('hora_inicio, hora_fin')
+            .eq('idFisioterapeuta', idFisioterapeuta)
+            .eq('dia_semana', diaSemana)
+
+        if (!horariosFisio || horariosFisio.length === 0) return []
+
+        const inicioDiaIso = new Date(yyyy, mm - 1, dd, 0, 0, 0).toISOString()
+        const finDiaIso = new Date(yyyy, mm - 1, dd, 23, 59, 59).toISOString()
+
+        const { data: citasDelDia } = await supabase
+            .from('Sesion')
+            .select('fecha_hora, tipo')
+            .eq('idFisioterapeuta', idFisioterapeuta)
+            .gte('fecha_hora', inicioDiaIso)
+            .lte('fecha_hora', finDiaIso)
+            .not('estado', 'in', '(cancelada,reprogramada,no_asistio)')
+
+        const citasOcupadas = (citasDelDia || []).map(cita => {
+            const fc = new Date(cita.fecha_hora)
+            const inicioMinutos = fc.getHours() * 60 + fc.getMinutes()
+            const duracionCita = cita.tipo === 'evaluacion' ? 20 : 60
+            return { inicio: inicioMinutos, fin: inicioMinutos + duracionCita }
+        })
+
+        const parseTime = (timeStr) => {
+            const [h, m] = timeStr.split(':').map(Number)
+            return h * 60 + m
+        }
+
+        const formatTime = (mins) => {
+            return `${String(Math.floor(mins / 60)).padStart(2, '0')}:${String(mins % 60).padStart(2, '0')}`
+        }
+
+        const slotsLibres = []
+
+        horariosFisio.forEach(bloque => {
+            let actual = parseTime(bloque.hora_inicio)
+            const finBloque = parseTime(bloque.hora_fin)
+
+            while (actual + duracionMinutos <= finBloque) {
+                const finActual = actual + duracionMinutos
+
+                // En lugar de solo saber si hay choque, averiguamos CON CUÁL cita choca
+                const choque = citasOcupadas.find(c => actual < c.fin && finActual > c.inicio)
+
+                if (!choque) {
+                    slotsLibres.push(formatTime(actual))
+                    // Si el espacio está libre, avanzamos el bloque completo (ej: 60 min)
+                    // para mostrar 08:00, 09:00, 10:00 y evitar agendas fragmentadas.
+                    actual += duracionMinutos
+                } else {
+                    // Si choca con una cita (ej. una evaluación de 08:00 a 08:20),
+                    // saltamos directamente a la hora en que termina esa cita (08:20).
+                    actual = choque.fin
+                }
+            }
+        })
+
+        return slotsLibres
+    }
+
+    const mapearModalidadATipo = (modalidad) => {
+        const mapas = {
+            'solo_evaluacion': 'evaluacion',
+            'evaluacion_sesion': 'evaluacion', // Esto ahora devolverá 'evaluacion'
+            'evaluacion_paquete': 'evaluacion',
+            'evaluacion_sesiones_libres': 'evaluacion',
+            'sesion_tratamiento': 'tratamiento_control'
+        };
+
+        // Si la modalidad no existe en el mapa, devolvemos 'evaluacion' por seguridad
+        return mapas[modalidad] || 'evaluacion';
+    };
+
+    // ── crearCita ───────────────────────────────────────────────────────────────
+    const crearCita = async (payload) => {
+        // 1. Validaciones básicas (Mantén las tuyas que ya funcionan perfectas)
+        if (!payload.idPaciente) { showAlert('Debe seleccionar un paciente.', 'error'); return false }
+        if (!payload.idFisioterapeuta) { showAlert('Debe seleccionar un fisioterapeuta.', 'error'); return false }
+        if (!payload.fecha_hora) { showAlert('Debe seleccionar fecha y hora.', 'error'); return false }
+
+        // 2. Validación de disponibilidad para la primera cita
+        const slotOcupado = await verificarDisponibilidad(payload.idFisioterapeuta, payload.fecha_hora)
+        if (slotOcupado) {
+            showAlert('Ese horario ya está ocupado para el fisioterapeuta seleccionado.', 'error')
+            return false
+        }
+
+        // ✅ 3. LÓGICA DE NEGOCIO Y DEUDA
+        // Evaluamos dónde se colocará el botón "Pagar"
+        let estadoPagoEval = 'pagado';
+        let estadoCitaEval = 'agendada'; // Nace gratis = nace confirmada
+
+        const tieneSesionesOpcionales = payload.sesionesOpcionales && payload.sesionesOpcionales.length > 0;
+        const vendeSesiones = payload.sesionesA_generar > 0;
+
+        // Si vende un paquete PERO no agendó ni una sesión hoy, la DEUDA se queda en la evaluación
+        // Si no, se iría sin pagar.
+        if (vendeSesiones && !tieneSesionesOpcionales) {
+            estadoPagoEval = 'pendiente';
+            estadoCitaEval = 'reservada';
+        }
+
+        loadingAccion.value = true;
+        try {
+            // 4. Guardamos la Evaluación Inicial
+            const { data: evaluacion, error: errEval } = await supabase
+                .from('Sesion')
+                .insert({
+                    idPaciente: payload.idPaciente,
+                    idFisioterapeuta: payload.idFisioterapeuta,
+                    fecha_hora: payload.fecha_hora,
+                    estado: estadoCitaEval,
+                    tipo: mapearModalidadATipo(payload.modalidad),
+                    sesiones_a_generar: payload.sesionesA_generar,
+                    numero_sesion: 1,
+                    observaciones: payload.observaciones,
+                    expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+                    idPaquete: payload.idPaquete,
+                    idServicio: payload.idServicio,
+                    estado_pago: estadoPagoEval
+                })
+                .select()
+                .single();
+
+            if (errEval) throw errEval;
+
+            // 5. Si agendó sesiones opcionales, las creamos en lote
+            if (tieneSesionesOpcionales) {
+                const sesionesData = payload.sesionesOpcionales.map((fechaIsoHora, index) => ({
+                    idPaciente: payload.idPaciente,
+                    idFisioterapeuta: payload.idFisioterapeuta,
+                    fecha_hora: fechaIsoHora,
+                    estado: 'reservada',
+                    tipo: 'tratamiento_control', // Es una sesión clínica normal
+                    sesiones_a_generar: 0,
+                    numero_sesion: index + 1,
+                    observaciones: 'Agendada desde la evaluación inicial.',
+                    idPaquete: payload.idPaquete,
+                    idServicio: payload.idServicio, // Hereda el servicio (ej. Paquete)
+                    // ✅ La primera sesión opcional recibe la deuda, las demás ya se cubren con ese pago
+                    estado_pago: index === 0 ? 'pendiente' : 'pagado'
+                }));
+
+                const { error: errSesiones } = await supabase
+                    .from('Sesion')
+                    .insert(sesionesData);
+
+                if (errSesiones) throw errSesiones;
+            }
+
+            showAlert('✅ Cita registrada exitosamente.', 'success');
+            return evaluacion;
+        } catch (err) {
+            showAlert('Error al registrar: ' + (err.hint || err.message), 'error');
+            return false;
+        } finally {
+            loadingAccion.value = false;
+        }
+    }
+
+    const saldoPaciente = ref(0);
+
+    // Agrega esta función
+    const fetchSaldoPaciente = async (idPaciente) => {
+        if (!idPaciente) { saldoPaciente.value = 0; return; }
+
+        const { data, error } = await supabase
+            .from('vw_saldo_paciente')
+            .select('total_disponible')
+            .eq('idPaciente', idPaciente)
+            .maybeSingle(); // Usamos maybeSingle porque puede que el paciente aún no tenga registros
+
+        saldoPaciente.value = data?.total_disponible ?? 0;
+    };
+
+    // ── registrarCheckIn ────────────────────────────────────────────────────────
+    // Asegúrate de que el parámetro se llame 'sesion' (o cámbialo a 'cita' en ambos lados)
+    const registrarCheckIn = async (sesion) => {
+        if (!sesion || !sesion.idSesion) {
+            console.error("Error: registrarCheckIn recibió un objeto inválido:", sesion);
+            return false;
+        }
+
+        loadingAccion.value = true;
+        try {
+            const { error } = await supabase
+                .from('Sesion')
+                .update({
+                    paciente_en_sala: true,
+                })
+                .eq('idSesion', sesion.idSesion);
+            if (error) throw error;
+
+            Object.assign(sesion, { ...sesion, paciente_en_sala: true });
+
+            showAlert('✅ Paciente registrado en sala.', 'success');
+            return true;
+        } catch (err) {
+            console.error("Error detallado:", err);
+            showAlert('Error al registrar: ' + err.message, 'error');
+            return false;
+        } finally {
+            loadingAccion.value = false;
+        }
+    }
+
+    // ── confirmarPago ───────────────────────────────────────────────────────────
+    const confirmarPago = async ({ idSesion, idPaciente, monto, metodoPago, numeroOperacion, idPaquete = null }) => {
+        if (!metodoPago) { showAlert('Seleccione el método de pago.', 'error'); return false }
+        if (monto === null || monto === undefined || monto <= 0) { showAlert('Ingrese un monto válido.', 'error'); return false }
+
+        loadingAccion.value = true
+        try {
+            // 1. Insertar el pago
+            const { error: errPago } = await supabase
+                .from('Pago')
+                .insert({
+                    idPaciente,
+                    idSesion: idPaquete ? null : idSesion,
+                    idPaquete: idPaquete || null,
+                    monto,
+                    metodo_pago: metodoPago,
+                    numero_operacion: numeroOperacion || null,
+                    estado_pago: 'completado',
+                })
+            if (errPago) throw errPago
+
+            // 2. Actualizar la sesión
+            // OJO: Si pagas un paquete, el TRIGGER actualizará el Paquete. 
+            // Pero la sesión específica también debe marcarse como pagada si era individual.
+
+            const payloadSesion = { expires_at: null };
+
+            // Si no es un paquete, la sesión en sí misma queda pagada.
+            if (!idPaquete) {
+                payloadSesion.estado_pago = 'pagado';
+            }
+
+            const { error: errSesion } = await supabase
+                .from('Sesion')
+                .update(payloadSesion)
+                .eq('idSesion', idSesion)
+
+            if (errSesion) throw errSesion
+
+            showAlert('✅ Pago registrado correctamente.', 'success')
+            return true
+        } catch (err) {
+            if (err.code === 'P0001') {
+                showAlert('Regla de negocio: ' + err.message, 'error')
+            } else {
+                showAlert('Error al confirmar el pago: ' + err.message, 'error')
+            }
+            return false
+        } finally {
+            loadingAccion.value = false
+        }
+    }
+
+    // ── cancelarCita ────────────────────────────────────────────────────────────
+    const cancelarCita = async ({ idSesion, motivo }) => {
+        if (!motivo?.trim()) { showAlert('Ingrese el motivo de la cancelación.', 'error'); return false }
+        loadingAccion.value = true
+        try {
+            const { error } = await supabase
+                .from('Sesion')
+                .update({ estado: 'cancelada', observaciones: motivo.trim() })
+                .eq('idSesion', idSesion)
+                .in('estado', ['reservada', 'agendada'])
+            if (error) throw error
+            showAlert('Cita cancelada correctamente.', 'info')
+            return true
+        } catch (err) {
+            showAlert('Error al cancelar la cita: ' + err.message, 'error')
+            return false
+        } finally {
+            loadingAccion.value = false
+        }
+    }
+
+    // ── marcarInasistencia ──────────────────────────────────────────────────────
+    const marcarInasistencia = async (idSesion) => {
+        loadingAccion.value = true
+        try {
+            const { error } = await supabase
+                .from('Sesion')
+                .update({ estado: 'no_asistio' })
+                .eq('idSesion', idSesion)
+                .eq('estado', 'agendada')
+            if (error) throw error
+            showAlert('Inasistencia registrada.', 'info')
+            return true
+        } catch (err) {
+            showAlert('Error al registrar inasistencia: ' + err.message, 'error')
+            return false
+        } finally {
+            loadingAccion.value = false
+        }
+    }
+
+    // ── verificarDisponibilidad ─────────────────────────────────────────────────
+    const verificarDisponibilidad = async (idFisioterapeuta, fecha_hora) => {
+        // 1. Usar un rango más limpio para la consulta
+        const fecha = new Date(fecha_hora);
+
+        // Obtenemos los componentes sin pelear con el TimezoneOffset
+        const year = fecha.getFullYear();
+        const month = String(fecha.getMonth() + 1).padStart(2, '0');
+        const day = String(fecha.getDate()).padStart(2, '0');
+        const hours = String(fecha.getHours()).padStart(2, '0');
+        const minutes = String(fecha.getMinutes()).padStart(2, '0');
+
+        // Formato YYYY-MM-DD HH:MM:00
+        const inicioBusqueda = `${year}-${month}-${day} ${hours}:${minutes}:00`;
+
+        // Para el fin, sumamos 59 minutos a la fecha original
+        const fechaFin = new Date(fecha.getTime() + (59 * 60 * 1000));
+        const yearF = fechaFin.getFullYear();
+        const monthF = String(fechaFin.getMonth() + 1).padStart(2, '0');
+        const dayF = String(fechaFin.getDate()).padStart(2, '0');
+        const hoursF = String(fechaFin.getHours()).padStart(2, '0');
+        const minutesF = String(fechaFin.getMinutes()).padStart(2, '0');
+        const finBusqueda = `${yearF}-${monthF}-${dayF} ${hoursF}:${minutesF}:59`;
+
+        const { data, error } = await supabase
+            .from('Sesion')
+            .select('idSesion')
+            .eq('idFisioterapeuta', idFisioterapeuta)
+            // Usamos not.in para excluir los estados que no bloquean horario
+            .not('"estado"', 'in', '("cancelada","reprogramada","no_asistio","atendida")')
+            .gte('fecha_hora', inicioBusqueda)
+            .lt('fecha_hora', finBusqueda)
+            .limit(1);
+
+        if (error) {
+            console.error("Error al verificar disponibilidad:", error);
+            return true; // Ante la duda, bloqueamos para evitar duplicados
+        }
+
+        return (data?.length ?? 0) > 0;
+    }
+
+    // ── Helpers de UI ────────────────────────────────────────────────────────────
+    const formatFechaHora = (iso) => {
+        if (!iso) return '—';
+        return new Intl.DateTimeFormat('es-PE', {
+            weekday: 'short', day: '2-digit', month: 'short',
+            year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true,
+            timeZone: 'America/Lima' // <--- FUERZA A LA ZONA HORARIA DE PERÚ
+        }).format(new Date(iso));
+    }
+
+    const getEstadoInfo = (estado) =>
+        ESTADOS_SESION[estado] ?? { label: estado, color: '#64748b', bg: '#f1f5f9' }
+
+    const nombreCompleto = (persona) => {
+        if (!persona) return '—'
+        return `${persona.nombres ?? ''} ${persona.apellidos ?? ''}`.trim()
+    }
+
+
+    // ── confirmarAsistencia (Para evaluaciones gratuitas) ───────────────────────
+    const confirmarAsistencia = async (idSesion) => {
+        loadingAccion.value = true
+        try {
+            const { error } = await supabase
+                .from('Sesion')
+                .update({ estado: 'agendada' })
+                .eq('idSesion', idSesion)
+                .eq('estado', 'reservada')
+
+            if (error) throw error
+            showAlert('✅ Asistencia confirmada por teléfono. La cita está lista para el paciente.', 'success')
+            return true
+        } catch (err) {
+            showAlert('Error al confirmar asistencia: ' + err.message, 'error')
+            return false
+        } finally {
+            loadingAccion.value = false
+        }
+    }
+
+    // ── reprogramarCita (Máximo 1 vez) ──────────────────────────────────────────
+const reprogramarCita = async ({ idSesion, idFisioterapeutaNuevo, nuevaFechaHora, motivo }) => {
+        if (!motivo?.trim()) { showAlert('Ingrese el motivo de reprogramación.', 'error'); return false }
+        if (!nuevaFechaHora) { showAlert('Seleccione la nueva fecha y hora.', 'error'); return false }
+        if (!idFisioterapeutaNuevo) { showAlert('Seleccione un fisioterapeuta.', 'error'); return false }
+
+        const fechaCita = new Date(nuevaFechaHora)
+        const ahora = new Date()
+        ahora.setMinutes(ahora.getMinutes() - 5) // 5 min de gracia
+
+        if (fechaCita < ahora) {
+            showAlert('La nueva fecha y hora de reprogramación no puede estar en el pasado.', 'error')
+            return false
+        }
+
+        loadingAccion.value = true
+        try {
+            // 1. Obtener los datos exactos de la sesión antigua
+            const { data: sesionAntigua, error: errGet } = await supabase
+                .from('Sesion')
+                .select('*')
+                .eq('idSesion', idSesion)
+                .single()
+            if (errGet) throw errGet
+
+            // 🛑 REGLA DE NEGOCIO: Si ya tiene idSesionOriginal, es que YA fue reprogramada antes.
+            if (sesionAntigua.idSesionOriginal !== null) {
+                throw new Error('Regla de negocio: Esta cita ya fue reprogramada anteriormente. Solo se permite una vez.')
+            }
+
+            // 2. Crear la NUEVA sesión clonando los datos de la antigua
+            const { data: nuevaSesion, error: errInsert } = await supabase
+                .from('Sesion')
+                .insert({
+                    idPaciente: sesionAntigua.idPaciente,
+                    idFisioterapeuta: idFisioterapeutaNuevo,
+                    fecha_hora: nuevaFechaHora,
+                    estado: sesionAntigua.estado, // Mantiene el estado (agendada o reservada)
+                    estado_pago: sesionAntigua.estado_pago, // 🔥 CRÍTICO: Mantener si estaba pagada o en cortesía
+                    tipo: sesionAntigua.tipo,
+                    numero_sesion: sesionAntigua.numero_sesion,
+                    observaciones: sesionAntigua.observaciones,
+                    idPaquete: sesionAntigua.idPaquete,
+                    idTratamiento: sesionAntigua.idTratamiento,
+                    idSesionOriginal: sesionAntigua.idSesion // 👈 MARCA QUE ES UNA REPROGRAMACIÓN
+                })
+                .select()
+                .single()
+            if (errInsert) throw errInsert
+
+            // 3. Si la cita antigua estaba pagada (y no era paquete), trasladamos el recibo de Pago a la nueva cita
+            if (sesionAntigua.estado === 'agendada' && !sesionAntigua.idPaquete) {
+                const { error: errPago } = await supabase
+                    .from('Pago')
+                    .update({ idSesion: nuevaSesion.idSesion })
+                    .eq('idSesion', sesionAntigua.idSesion)
+
+                if (errPago) {
+                    // 🚨 ROLLBACK: Si falla el pago, borramos la cita nueva y abortamos
+                    await supabase.from('Sesion').delete().eq('idSesion', nuevaSesion.idSesion)
+                    throw new Error('No se pudo trasladar el recibo de pago. Se canceló la reprogramación.')
+                }
+            }
+
+            // 4. Cancelar la cita antigua y pasarla a estado 'reprogramada'
+            const { error: errUpdate } = await supabase
+                .from('Sesion')
+                .update({
+                    estado: 'reprogramada',
+                    observaciones: `Reprogramada. Motivo: ${motivo.trim()}`
+                })
+                .eq('idSesion', idSesion)
+            
+            // 🚨 ROLLBACK DE EMERGENCIA: Si el trigger u otra cosa bloquea actualizar la cita antigua,
+            // destruimos la cita clonada para que no queden duplicados "fantasmas".
+            if (errUpdate) {
+                await supabase.from('Sesion').delete().eq('idSesion', nuevaSesion.idSesion)
+                throw errUpdate
+            }
+
+            showAlert('✅ Cita reprogramada exitosamente.', 'success')
+            return true
+        } catch (err) {
+            showAlert('Error al reprogramar: ' + (err.message || err.hint || 'Error desconocido'), 'error')
+            return false
+        } finally {
+            loadingAccion.value = false
+        }
+    }
+
+    const tarifario = ref([]);
+    const fetchTarifario = async () => {
+        const { data, error } = await supabase
+            .from('Catalogo_Servicio')
+            .select('idServicio, nombre, precio, tipo')
+            .eq('activo', true);
+
+        if (!error) tarifario.value = data;
+    };
+
+    return {
+        // Estado
+        citas, fisios, pacientes, paquetes, horarios,
+        loading, loadingAccion, userRole, userId,
+        // Computed de rol
+        esFisioterapeuta, esSecretaria, esPaciente, esAdmin, puedeGestionar,
+        // Acciones
+        initUser,
+        fetchCitas, fetchFisios, fetchPacientes,
+        fetchPaquetesPaciente,
+        fetchHorarioFisio,
+        obtenerSlotsDisponibles, fetchTarifario, // ← EXPUESTA AQUÍ
+        crearCita, registrarCheckIn, confirmarPago, saldoPaciente,
+        cancelarCita, marcarInasistencia, confirmarAsistencia, reprogramarCita,
+        // Helpers
+        formatFechaHora, getEstadoInfo, nombreCompleto, verificarDisponibilidad, fetchSaldoPaciente,
+    }
+}
+
+</frontend_composables>
+
+<frontend_components>
+--- ModalNuevaCita.vue ---
+<script setup>
+/**
+ * ModalNuevaCita.vue — v4 REFACTORIZADO
+ * 
+ * MEJORAS:
+ * - Usa dateUtils para formateo de fechas
+ * - Usa useSearch para búsqueda reutilizable
+ * - Usa validators para validaciones centralizadas
+ */
+import { ref, computed, watch } from 'vue'
+import { MODALIDADES, useCitas } from '@/composables/useCitas'
+import { useSearch } from '@/composables/useSearch'
+import { getTodayISO } from '@/lib/dateUtils'
+
+const props = defineProps({
+  isOpen: { type: Boolean, required: true },
+  fisios: { type: Array, default: () => [] },
+  pacientes: { type: Array, default: () => [] },
+  tarifario: { type: Array, default: () => [] },
+  paquetes: { type: Array, default: () => [] },
+  loadingAccion: { type: Boolean, default: false },
+})
+
+const precioEstimado = computed(() => {
+  const mod = modalidad.value
+  if (!mod) return 0
+
+  // Obtenemos el precio base de 1 sesión (S/ 60.00)
+  const sesionIndiv = props.tarifario.find(t => t.tipo === 'sesion_suelta')?.precio || 0
+
+  // 1. EVALUACIÓN INICIAL PURA: Es totalmente gratis
+  if (mod === 'solo_evaluacion') return 0
+
+  // 2. PAQUETES: Cuesta lo que diga el catálogo para ese paquete específico
+  if (mod === 'evaluacion_paquete') {
+    return props.tarifario.find(t => t.idServicio === idPaquete.value)?.precio || 0
+  }
+
+  // 3. SESIONES LIBRES: Costo de 1 sesión multiplicada por la cantidad que elijan
+  if (mod === 'evaluacion_sesiones_libres') {
+    return sesionIndiv * cantidadSesiones.value
+  }
+
+  // 4. EVALUACIÓN + 1 SESIÓN / SESIÓN DE TRATAMIENTO NORMAL: Cuestan exactamente 1 sesión
+  if (['evaluacion_sesion', 'sesion_tratamiento'].includes(mod)) {
+    return sesionIndiv
+  }
+
+  return 0
+})
+
+const emit = defineEmits(['close', 'submit', 'paciente-changed', 'fisio-changed'])
+const { obtenerSlotsDisponibles, fetchSaldoPaciente, saldoPaciente, registrarCheckIn } = useCitas();
+
+// ── Campos principales ───────────────────────────────────────────────────────
+const idPaciente = ref(null)
+const idFisioterapeuta = ref(null)
+const fecha = ref('')
+const hora = ref('')
+const modalidad = ref(null)
+const idPaquete = ref(null)
+const cantidadSesiones = ref(1)
+const observaciones = ref('')
+
+const sesionesOpcionales = ref([]) 
+const incluyeSesiones = computed(() => ['evaluacion_sesion', 'evaluacion_paquete', 'evaluacion_sesiones_libres'].includes(modalidad.value))
+
+const agregarSesionOpcional = () => {
+  sesionesOpcionales.value.push({ fecha: '', hora: '', slots: [], loading: false })
+}
+
+const buscarSlotsParaOpcional = async (index) => {
+  const s = sesionesOpcionales.value[index]
+  if (!s.fecha || !idFisioterapeuta.value) return
+
+  s.loading = true
+  s.hora = ''
+  try {
+    const horarios = await obtenerSlotsDisponibles(idFisioterapeuta.value, s.fecha, 60) // Tratamiento siempre es 60 min
+
+    const ahora = new Date()
+    const esHoy = s.fecha === ahora.toISOString().split('T')[0]
+
+    if (esHoy) {
+      const horaActual = ahora.getHours()
+      const minActual = ahora.getMinutes()
+      s.slots = horarios.filter(slot => {
+        const [h, m] = slot.split(':').map(Number)
+        return h > horaActual || (h === horaActual && m > minActual)
+      })
+    } else {
+      s.slots = horarios
+    }
+  } catch(e) {
+    s.slots = []
+  } finally {
+    s.loading = false
+  }
+}
+
+const MODALIDAD_CONFIG = {
+  solo_evaluacion: { requierePaquete: false, requiereSesiones: false, base: 'evaluacion' },
+  evaluacion_sesion: { requierePaquete: false, requiereSesiones: false, base: 'evaluacion' },
+  evaluacion_paquete: { requierePaquete: true, requiereSesiones: false, base: 'paquete' },
+  evaluacion_sesiones_libres: { requierePaquete: false, requiereSesiones: true, base: 'evaluacion' },
+  sesion_tratamiento: { requierePaquete: false, requiereSesiones: false, base: 'tratamiento' }
+}
+
+// ── Estados para los Buscadores Inteligentes (Refactorizado con useSearch) ──
+const {
+  searchQuery: searchPaciente,
+  filteredItems: pacientesFiltrados
+} = useSearch(computed(() => props.pacientes), (p) => {
+  const nombre = nombrePaciente(p).toLowerCase()
+  const doc = p.Persona?.numero_documento?.toLowerCase() || ''
+  return `${nombre} ${doc}`
+})
+
+const showPacienteList = ref(false)
+
+const {
+  searchQuery: searchFisio,
+  filteredItems: fisiosFiltrados
+} = useSearch(computed(() => props.fisios), (f) => nombreFisio(f).toLowerCase())
+
+const showFisioList = ref(false)
+
+const seleccionarPaciente = async (p) => {
+  idPaciente.value = p.idPaciente
+  searchPaciente.value = nombrePaciente(p)
+  showPacienteList.value = false
+  saldoPaciente.value = null
+  await fetchSaldoPaciente(p.idPaciente)
+}
+
+watch(searchPaciente, (newVal) => {
+  const pacienteActual = props.pacientes.find(p => p.idPaciente === idPaciente.value)
+  if (pacienteActual && newVal !== nombrePaciente(pacienteActual)) {
+    idPaciente.value = null
+  }
+})
+
+const seleccionarFisio = (f) => {
+  idFisioterapeuta.value = f.idFisioterapeuta
+  searchFisio.value = nombreFisio(f)
+  showFisioList.value = false
+}
+
+watch(searchFisio, (newVal) => {
+  const fisioActual = props.fisios.find(f => f.idFisioterapeuta === idFisioterapeuta.value)
+  if (fisioActual && newVal !== nombreFisio(fisioActual)) {
+    idFisioterapeuta.value = null
+  }
+})
+
+const hidePacienteDelay = () => setTimeout(() => { showPacienteList.value = false }, 200)
+const hideFisioDelay = () => setTimeout(() => { showFisioList.value = false }, 200)
+
+// ── Estados de Slots ─────────────────────────────────────────────────────────
+const slotsDisponibles = ref([])
+const loadingSlots = ref(false)
+registrarCheckIn
+// ── Computed ─────────────────────────────────────────────────────────────────
+const modalidadActual = computed(() => MODALIDADES.find(m => m.id === modalidad.value) ?? null)
+const requierePaquete = computed(() => modalidad.value === 'evaluacion_paquete')
+const requiereSesiones = computed(() => modalidad.value === 'evaluacion_sesiones_libres')
+const esTratamiento = computed(() => modalidad.value === 'sesion_tratamiento')
+
+const fechaMin = computed(() => getTodayISO())
+
+// ── Watchers ─────────────────────────────────────────────────────────────────
+watch(modalidad, () => {
+  idPaquete.value = null
+  cantidadSesiones.value = 1
+  sesionesOpcionales.value = [] // ✅ Limpiamos las sesiones opcionales si cambia de modalidad
+})
+
+watch(idPaciente, async (val) => {
+  idPaquete.value = null;
+  emit('paciente-changed', val);
+
+  // Consultamos el saldo cuando el paciente cambia
+  await fetchSaldoPaciente(val);
+});
+
+// ✅ Restaurado: Avisar al padre si el fisio cambia
+watch(idFisioterapeuta, (val) => {
+  emit('fisio-changed', val)
+})
+
+// Watcher inteligente para cargar huecos según duración
+watch([idFisioterapeuta, fecha, modalidad], async ([idFisio, f, mod]) => {
+  if (!idFisio || !f || !mod) {
+    slotsDisponibles.value = []
+    hora.value = ''
+    return
+  }
+
+  loadingSlots.value = true
+  try {
+    const duracionExigida = mod === 'sesion_tratamiento' ? 60 : 20
+    slotsDisponibles.value = await obtenerSlotsDisponibles(idFisio, f, duracionExigida)
+  } catch (error) {
+    console.error("Error al buscar horarios:", error)
+    slotsDisponibles.value = []
+  } finally {
+    if (!slotsDisponibles.value.includes(hora.value)) {
+      hora.value = ''
+    }
+    loadingSlots.value = false
+  }
+})
+
+watch(() => props.isOpen, (abierto) => {
+  if (abierto) resetForm()
+})
+
+// ── Métodos ───────────────────────────────────────────────────────────────────
+const resetForm = () => {
+  idPaciente.value = null
+  searchPaciente.value = ''
+  idFisioterapeuta.value = null
+  searchFisio.value = ''
+  fecha.value = ''
+  hora.value = ''
+  modalidad.value = null
+  idPaquete.value = null
+  cantidadSesiones.value = 1
+  observaciones.value = ''
+  slotsDisponibles.value = []
+}
+
+// Dentro del método handleSubmit en ModalNuevaCita.vue
+const handleSubmit = () => {
+  const config = MODALIDAD_CONFIG[modalidad.value]
+
+  // Extraemos y formateamos solo las sesiones opcionales que sí se llenaron
+  const sesionesExtra = sesionesOpcionales.value
+    .filter(s => s.fecha && s.hora)
+    .map(s => `${s.fecha}T${s.hora}:00-05:00`)
+
+  let sesionesA = 0;
+  if (modalidad.value === 'evaluacion_sesion') sesionesA = 1;
+  if (modalidad.value === 'evaluacion_sesiones_libres') sesionesA = cantidadSesiones.value;
+
+  const payload = {
+    idPaciente: idPaciente.value,
+    idFisioterapeuta: idFisioterapeuta.value,
+    fecha_hora: `${fecha.value}T${hora.value}:00-05:00`,
+    modalidad: modalidad.value,
+    idPaquete: config.requierePaquete ? idPaquete.value : null,
+    cantidadSesiones: config.requiereSesiones ? cantidadSesiones.value : null,
+    observaciones: observaciones.value,
+    sesionesA_generar: sesionesA, // Enviamos el número exacto
+    sesionesOpcionales: sesionesExtra // Enviamos las fechas opcionales
+  }
+
+  emit('submit', payload)
+}
+
+// ✅ Agrega esto junto a tus otras propiedades computadas
+const slotsFiltrados = computed(() => {
+  if (loadingSlots.value) return [];
+
+  const ahora = new Date();
+  const fechaHoy = ahora.toISOString().split('T')[0];
+
+  // Si la fecha seleccionada no es hoy, devolvemos todo
+  if (fecha.value !== fechaHoy) return slotsDisponibles.value;
+
+  // Si es hoy, filtramos las horas que ya pasaron
+  const horaActual = ahora.getHours();
+  const minActual = ahora.getMinutes();
+
+  return slotsDisponibles.value.filter(slot => {
+    const [h, m] = slot.split(':').map(Number);
+    // Permite horas futuras o la misma hora con minutos futuros
+    return h > horaActual || (h === horaActual && m > minActual);
+  });
+});
+
+const nombreFisio = (f) => `${f.Persona?.nombres ?? ''} ${f.Persona?.apellidos ?? ''} — ${f.especialidad}`.trim()
+const nombrePaciente = (p) => `${p.Persona?.nombres ?? ''} ${p.Persona?.apellidos ?? ''}`.trim()
+
+</script>
+
+<template>
+  <Transition name="fade-modal">
+    <div v-if="isOpen" class="modal-overlay" @click.self="emit('close')">
+      <div class="modal-window modal-cita">
+
+        <div class="modal-header">
+          <h3>Registrar Nueva Cita</h3>
+          <button class="close-x" @click="emit('close')" :disabled="loadingAccion">&times;</button>
+        </div>
+
+        <form @submit.prevent="handleSubmit" class="modal-form" novalidate>
+
+          <div class="form-section">
+            <p class="section-label">1. Participantes</p>
+            <div class="form-grid">
+
+              <div class="input-group" style="position: relative;">
+                <label>Paciente <span class="req">*</span></label>
+                <input type="text" v-model="searchPaciente" @focus="showPacienteList = true" @blur="hidePacienteDelay"
+                  placeholder="🔍 Buscar por nombre o DNI..." required class="search-input"
+                  :class="{ 'is-selected': idPaciente }" />
+                <span v-if="idPaciente" class="valid-check">✅</span>
+                <div v-if="idPaciente" class="field-hint" style="margin-top: 5px;">
+                  <span>Sesiones disponibles: </span>
+                  <strong :class="saldoPaciente > 0 ? 'text-green' : 'text-red'">
+                    {{ saldoPaciente }} sesiones
+                  </strong>
+                </div>
+
+                <ul v-if="showPacienteList && pacientesFiltrados.length > 0" class="options-list">
+                  <li v-for="p in pacientesFiltrados" :key="p.idPaciente" @click="seleccionarPaciente(p)">
+                    <div class="li-name">{{ p.Persona?.nombres }} {{ p.Persona?.apellidos }}</div>
+                    <div class="li-sub">Doc: {{ p.Persona?.numero_documento || 'S/N' }}</div>
+                  </li>
+                </ul>
+                <ul v-if="showPacienteList && pacientesFiltrados.length === 0" class="options-list">
+                  <li class="no-results">No se encontraron pacientes.</li>
+                </ul>
+              </div>
+
+              <div class="input-group" style="position: relative;">
+                <label>Fisioterapeuta <span class="req">*</span></label>
+                <input type="text" v-model="searchFisio" @focus="showFisioList = true" @blur="hideFisioDelay"
+                  placeholder="🔍 Buscar especialista..." required class="search-input"
+                  :class="{ 'is-selected': idFisioterapeuta }" />
+                <span v-if="idFisioterapeuta" class="valid-check">✅</span>
+
+                <ul v-if="showFisioList && fisiosFiltrados.length > 0" class="options-list">
+                  <li v-for="f in fisiosFiltrados" :key="f.idFisioterapeuta" @click="seleccionarFisio(f)">
+                    <div class="li-name">{{ f.Persona?.nombres }} {{ f.Persona?.apellidos }}</div>
+                    <div class="li-sub">{{ f.especialidad }}</div>
+                  </li>
+                </ul>
+              </div>
+
+            </div>
+          </div>
+
+          <div class="form-section">
+            <p class="section-label">2. Modalidad de atención <span class="req">*</span></p>
+            <div class="modalidad-grid">
+              <button v-for="m in MODALIDADES" :key="m.id" type="button" class="modalidad-card"
+                :class="{ selected: modalidad === m.id }" :style="modalidad === m.id ? `--card-color: ${m.color}` : ''"
+                @click="modalidad = m.id">
+                <span class="modalidad-icono">{{ m.icono }}</span>
+                <span class="modalidad-nombre">{{ m.label }}</span>
+                <span class="modalidad-desc">{{ m.descripcion }}</span>
+              </button>
+            </div>
+          </div>
+
+          <Transition name="slide-input">
+            <div v-if="requierePaquete" class="input-group">
+              <label>Seleccionar Paquete <span style="color: red">*</span></label>
+              <select v-model="idPaquete" required>
+                <option value="" disabled>Seleccione un paquete del catálogo...</option>
+                <option v-for="p in tarifario.filter(t => t.tipo === 'paquete')" :key="p.idServicio"
+                  :value="p.idServicio">
+                  {{ p.nombre }} - S/ {{ p.precio }}
+                </option>
+              </select>
+            </div>
+          </Transition>
+
+          <Transition name="slide-input">
+            <div v-if="requiereSesiones" class="form-section">
+              <p class="section-label">3. Sesiones adicionales</p>
+              <div class="input-group" style="max-width: 200px">
+                <label>Cantidad de sesiones <span class="req">*</span></label>
+                <input type="number" v-model.number="cantidadSesiones" min="1" max="50" placeholder="Ej: 8" />
+              </div>
+              <p class="field-hint">Se agendarán individualmente tras la evaluación.</p>
+            </div>
+          </Transition>
+
+          <div class="form-section">
+            <p class="section-label">
+              {{ requierePaquete || requiereSesiones ? '4.' : '3.' }} Fecha y Horario Disponible
+            </p>
+            <div class="form-grid">
+              <div class="input-group">
+                <label>Fecha de la cita <span class="req">*</span></label>
+                <input type="date" v-model="fecha" :min="fechaMin" required />
+              </div>
+              <div class="input-group">
+                <label>Horario disponible <span class="req">*</span></label>
+                <select v-model="hora" required :disabled="!fecha || !idFisioterapeuta || !modalidad || loadingSlots">
+                  <option value="" disabled>
+                    {{
+                      loadingSlots ? 'Buscando huecos libres...' :
+                        (!idFisioterapeuta ? '⚠️ Falta Especialista' :
+                          (!modalidad ? '⚠️ Falta Modalidad' :
+                            (!fecha ? '⚠️ Falta Fecha' : '— Seleccione hora —')))
+                    }}
+                  </option>
+
+                  <option v-for="slot in slotsFiltrados" :key="slot" :value="slot">
+                    {{ slot }}
+                  </option>
+                </select>
+                <p v-if="fecha && idFisioterapeuta && modalidad && slotsFiltrados.length === 0 && !loadingSlots"
+                  class="field-hint warn">
+                  ⚠️ No hay horarios disponibles para el resto del día.
+                </p>
+              </div>
+
+              <div class="input-group span-2">
+                <label>Observaciones (opcional)</label>
+                <input type="text" v-model="observaciones" placeholder="Ej: Paciente con movilidad reducida"
+                  maxlength="200" />
+              </div>
+
+            </div>
+          </div>
+
+                 <Transition name="slide-input">
+            <div v-if="incluyeSesiones" class="form-section" style="background: #f8fafc; padding: 15px; border-radius: 8px; border: 1px dashed var(--blue);">
+              <p class="section-label" style="color: var(--blue);">Agendar Sesiones de Tratamiento (Opcional)</p>
+              <p class="field-hint">Si el paciente ya sabe cuándo vendrá a sus terapias, agéndelas aquí. Si no, déjelo en blanco y use su saldo después.</p>
+
+              <div v-for="(sesion, index) in sesionesOpcionales" :key="index" class="form-grid" style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #e2e8f0;">
+                <div class="input-group">
+                  <label>Fecha Tratamiento {{ index + 1 }}</label>
+                  <input type="date" v-model="sesion.fecha" :min="fechaMin" @change="buscarSlotsParaOpcional(index)" />
+                </div>
+                <div class="input-group">
+                  <label>Hora</label>
+                  <select v-model="sesion.hora" :disabled="!sesion.fecha || sesion.loading">
+                    <option value="" disabled>{{ sesion.loading ? 'Buscando huecos...' : (sesion.fecha ? '— Seleccione hora —' : '⚠️ Elija fecha') }}</option>
+                    <option v-for="slot in sesion.slots" :key="slot" :value="slot">{{ slot }}</option>
+                  </select>
+                </div>
+                <div style="grid-column: span 2; text-align: right;">
+                  <button type="button" @click="sesionesOpcionales.splice(index, 1)" style="color: #ef4444; background: none; border: none; font-size: 12px; cursor: pointer; font-weight: bold;">
+                    &times; Eliminar esta sesión
+                  </button>
+                </div>
+              </div>
+
+              <button type="button" class="btn-secondary" @click="agregarSesionOpcional" style="margin-top: 12px; width: 100%; justify-content: center;">
+                + Añadir fecha de tratamiento
+              </button>
+            </div>
+          </Transition>
+
+          <div v-if="modalidadActual" class="resumen-box" :style="`border-color: ${modalidadActual.color}`">
+            <span class="resumen-icono">{{ modalidadActual.icono }}</span>
+            <div>
+              <strong>{{ modalidadActual.label }}</strong>
+              <p>{{ modalidadActual.descripcion }}</p>
+
+              <div v-if="precioEstimado !== null" class="precio-badge">
+                Costo: <strong>S/ {{ Number(precioEstimado).toFixed(2) }}</strong>
+              </div>
+            </div>
+          </div>
+
+          <div class="modal-actions">
+            <button type="button" class="btn-secondary" @click="emit('close')" :disabled="loadingAccion">
+              Cancelar
+            </button>
+            <button type="submit" class="btn-primary-submit"
+              :disabled="loadingAccion || !idPaciente || !idFisioterapeuta || !fecha || !hora || !modalidad || (esTratamiento && saldoPaciente <= 0)">
+              <span v-if="loadingAccion" class="btn-spinner"></span>
+              <span v-else>
+                {{ (esTratamiento && saldoPaciente <= 0) ? 'Saldo insuficiente' : 'Registrar Cita' }} </span>
+            </button>
+          </div>
+
+        </form>
+      </div>
+    </div>
+  </Transition>
+</template>
+
+--- ModalReprogramarCita.vue ---
+<script setup>
+/**
+ * ModalReprogramarCita.vue — v3 BLINDADO
+ * * MEJORAS:
+ * - Usa getTodayISO para fechas en todo el componente
+ * - Eliminado toISOString() para evitar desfase de UTC-5
+ * - Usa useSearch para búsqueda
+ */
+import { ref, watch, computed } from 'vue'
+import { useCitas } from '@/composables/useCitas'
+import { useSearch } from '@/composables/useSearch'
+import { getTodayISO } from '@/lib/dateUtils'
+
+const props = defineProps({
+  isOpen: { type: Boolean, required: true },
+  sesion: { type: Object, default: null },
+  fisios: { type: Array, default: () => [] },
+  loadingAccion: { type: Boolean, default: false }
+})
+
+const emit = defineEmits(['close', 'submit'])
+const { obtenerSlotsDisponibles } = useCitas()
+
+const idFisioterapeuta = ref(null)
+const fecha = ref('')
+const hora = ref('')
+const motivo = ref('')
+
+// ✅ Usando useSearch para búsqueda consistente
+const { 
+  searchQuery: searchFisio, 
+  filteredItems: fisiosFiltrados 
+} = useSearch(computed(() => props.fisios), (f) => 
+  `${f.Persona?.nombres} ${f.Persona?.apellidos}`.toLowerCase()
+)
+
+const showFisioList = ref(false)
+const slotsDisponibles = ref([])
+const loadingSlots = ref(false)
+
+const fechaMin = computed(() => getTodayISO())
+
+const slotsFiltrados = computed(() => {
+  if (loadingSlots.value) return [];
+
+  const ahora = new Date();
+  // ✅ CORRECCIÓN: Usamos tu función local para evitar que brinque al día siguiente en la noche
+  const fechaHoy = getTodayISO();
+
+  if (fecha.value !== fechaHoy) return slotsDisponibles.value;
+
+  const horaActual = ahora.getHours();
+  const minActual = ahora.getMinutes();
+
+  return slotsDisponibles.value.filter(slot => {
+    const [h, m] = slot.split(':').map(Number);
+    return h > horaActual || (h === horaActual && m > minActual);
+  });
+});
+
+// Precargar datos al abrir
+watch(() => props.isOpen, (abierto) => {
+  if (abierto && props.sesion) {
+    idFisioterapeuta.value = props.sesion.idFisioterapeuta
+    const fisioActual = props.fisios.find(f => f.idFisioterapeuta === idFisioterapeuta.value)
+    searchFisio.value = fisioActual ? `${fisioActual.Persona?.nombres} ${fisioActual.Persona?.apellidos}` : ''
+    fecha.value = ''
+    hora.value = ''
+    motivo.value = ''
+    slotsDisponibles.value = []
+  }
+})
+
+const seleccionarFisio = (f) => {
+  idFisioterapeuta.value = f.idFisioterapeuta
+  searchFisio.value = `${f.Persona?.nombres} ${f.Persona?.apellidos}`
+  showFisioList.value = false
+}
+
+const hideFisioDelay = () => setTimeout(() => { showFisioList.value = false }, 200)
+
+// Calcular horarios al cambiar fisio o fecha
+watch([idFisioterapeuta, fecha], async ([idFisio, f]) => {
+  if (!idFisio || !f) { slotsDisponibles.value = []; hora.value = ''; return }
+  loadingSlots.value = true
+  const duracion = props.sesion?.tipo === 'evaluacion' ? 20 : 60
+  slotsDisponibles.value = await obtenerSlotsDisponibles(idFisio, f, duracion)
+  if (!slotsDisponibles.value.includes(hora.value)) hora.value = ''
+  loadingSlots.value = false
+})
+
+const handleSubmit = () => {
+  if (!fecha.value || !hora.value || !motivo.value.trim()) return
+
+  // ✅ CORRECCIÓN: Forzamos el string exacto con la zona horaria -05:00
+  const fechaHoraIso = `${fecha.value}T${hora.value}:00-05:00`
+
+  emit('submit', {
+    idSesion: props.sesion.idSesion,
+    idFisioterapeutaNuevo: idFisioterapeuta.value,
+    nuevaFechaHora: fechaHoraIso,
+    motivo: motivo.value
+  })
+}
+</script>
+
+<template>
+  <Transition name="fade-modal">
+    <div v-if="isOpen" class="modal-overlay" @click.self="emit('close')">
+      <div class="modal-window" style="max-width: 500px;">
+        <div class="modal-header">
+          <h3>Reprogramar Cita</h3>
+          <button class="close-x" @click="emit('close')" :disabled="loadingAccion">&times;</button>
+        </div>
+
+        <form @submit.prevent="handleSubmit" class="modal-form">
+          <div class="cancelacion-aviso"
+            style="margin-bottom: 16px; background: #e0f2fe; border-color: #bae6fd; color: #0369a1;">
+            <strong>Atención:</strong> Las citas solo pueden ser reprogramadas 1 vez.
+          </div>
+
+          <div class="input-group" style="position: relative;">
+            <label>Nuevo Fisioterapeuta <span class="req">*</span></label>
+            <input type="text" v-model="searchFisio" @focus="showFisioList = true" @blur="hideFisioDelay"
+              placeholder="🔍 Buscar especialista..." required class="search-input"
+              :class="{ 'is-selected': idFisioterapeuta }" />
+            <ul v-if="showFisioList && fisiosFiltrados.length > 0" class="options-list">
+              <li v-for="f in fisiosFiltrados" :key="f.idFisioterapeuta" @click="seleccionarFisio(f)">
+                <div class="li-name">{{ f.Persona?.nombres }} {{ f.Persona?.apellidos }}</div>
+                <div class="li-sub">{{ f.especialidad }}</div>
+              </li>
+            </ul>
+          </div>
+
+          <div class="form-grid">
+            <div class="input-group">
+              <label>Nueva Fecha <span class="req">*</span></label>
+              <input type="date" v-model="fecha" :min="fechaMin" required />
+            </div>
+            <div class="input-group">
+              <label>Nuevo Horario <span class="req">*</span></label>
+              <select v-model="hora" required :disabled="!fecha || !idFisioterapeuta || loadingSlots">
+                <option value="" disabled>{{ loadingSlots ? 'Buscando huecos...' : '— Seleccione hora —' }}</option>
+                <option v-for="slot in slotsFiltrados" :key="slot" :value="slot">
+                  {{ slot }}
+                </option>
+              </select>
+              <p v-if="fecha && idFisioterapeuta && slotsFiltrados.length === 0 && !loadingSlots"
+                class="field-hint warn">
+                ⚠️ No hay horarios disponibles para el resto del día.
+              </p>
+            </div>
+          </div>
+
+          <div class="input-group">
+            <label>Motivo de la reprogramación <span class="req">*</span></label>
+            <textarea v-model="motivo" rows="3" placeholder="Ej: El paciente solicitó cambio de turno..." required
+              maxlength="250"></textarea>
+          </div>
+
+          <div class="modal-actions">
+            <button type="button" class="btn-secondary" @click="emit('close')"
+              :disabled="loadingAccion">Cancelar</button>
+            <button type="submit" class="btn-primary-submit"
+              :disabled="loadingAccion || !hora || !fecha || !motivo.trim()">
+              <span v-if="loadingAccion">Procesando...</span>
+              <span v-else>Confirmar Reprogramación</span>
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </Transition>
+</template>
+
+</frontend_components>
+
