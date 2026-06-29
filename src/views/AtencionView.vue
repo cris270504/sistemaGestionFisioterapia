@@ -4,31 +4,25 @@ import { useRoute, useRouter } from 'vue-router'
 import { supabase } from '@/lib/supabaseClient'
 import { useAlert } from '@/composables/useAlert'
 
+// ── IMPORTACIÓN DE TUS NUEVOS COMPONENTES MODULARES ──
+import FichaEvaluacionInicial from '@/components/FichaEvaluacionInicial.vue'
+import FormularioEvolucion from '@/components/FormularioEvolucion.vue'
+
 const route = useRoute()
 const router = useRouter()
 const { showAlert } = useAlert()
 
 const idSesion = route.params.idSesion
 const loading = ref(true)
-const saving = ref(false)
 
 // ── Estados Principales ──
 const sesion = ref(null)
 const paciente = ref(null)
 
-// ── Campos para Tratamiento (Sesión regular) ──
-const notasEvolucion = ref('')
-const indicaciones = ref('')
-
-// ── Campos para Evaluación Inicial ──
-const idEvaluacion = ref(null)
-const motivoConsulta = ref('')
-const apuntesGenerales = ref('')
-const ejerciciosRealizados = ref('')
-const observacionesEval = ref('')
-
-// Determina dinámicamente qué formulario mostrar
-const isEvaluacion = computed(() => sesion.value?.tipo === 'evaluacion')
+// ── Lógica de UI ──
+const showModalAntecedentes = ref(false)
+const savingAntecedentes = ref(false)
+const verFichaHistorica = ref(false) // Controla el modal de lectura pedido por la fisio
 
 const antecedentes = ref({
   alergias: '',
@@ -37,8 +31,44 @@ const antecedentes = ref({
   quirurgicos: '',
   observaciones: ''
 })
-const showModalAntecedentes = ref(false)
-const savingAntecedentes = ref(false)
+
+// Determina dinámicamente qué componente renderizar
+const isEvaluacion = computed(() => sesion.value?.tipo === 'evaluacion' || sesion.value?.es_evaluacion_inicial)
+const isMasaje = computed(() => sesion.value?.tipo === 'masaje') // 👈 Detecta si es una cita de masajes
+
+const tipoMasaje = ref('')
+const comentarioMasaje = ref('')
+const savingMasaje = ref(false)
+
+const guardarAtencionMasaje = async () => {
+  if (!tipoMasaje.value.trim()) {
+    showAlert('Por favor, especifique el tipo de masaje realizado.', 'error')
+    return
+  }
+
+  savingMasaje.value = true
+  try {
+    // Concatenamos de forma limpia los dos datos dentro del campo notas_evolucion
+    const NotasEvolucionFinal = `Tipo de Masaje: ${tipoMasaje.value.trim()} | Observaciones: ${comentarioMasaje.value.trim() || 'Sin observaciones adicionales.'}`
+
+    const { error } = await supabase
+      .from('Sesion')
+      .update({
+        notas_evolucion: NotasEvolucionFinal,
+        estado: 'atendida' // Transiciona la cita directamente a atendida
+      })
+      .eq('idSesion', idSesion)
+
+    if (error) throw error
+
+    showAlert('💆 Sesión de masaje registrada correctamente.', 'success')
+    router.push('/citas')
+  } catch (err) {
+    showAlert('Error al registrar la atención de masaje: ' + err.message, 'error')
+  } finally {
+    savingMasaje.value = false
+  }
+}
 
 const cargarSesionClinica = async () => {
   try {
@@ -59,6 +89,7 @@ const cargarSesionClinica = async () => {
     sesion.value = dataSesion
     paciente.value = dataSesion.Paciente.Persona
 
+    // Cargamos Antecedentes para la barra lateral
     const { data: dataAntec, error: errAntec } = await supabase
       .from('Antecedentes')
       .select('*')
@@ -77,26 +108,8 @@ const cargarSesionClinica = async () => {
       }
     }
 
-    if (dataSesion.tipo === 'evaluacion') {
-      const { data: dataEval, error: errEval } = await supabase
-        .from('Evaluacion_inicial')
-        .select('*')
-        .eq('idSesion', idSesion)
-        .maybeSingle()
-
-      if (errEval) throw errEval
-
-      if (dataEval) {
-        idEvaluacion.value = dataEval.idEvaluacionInicial
-        motivoConsulta.value = dataEval.motivo_consulta || ''
-        apuntesGenerales.value = dataEval.apuntes_generales || ''
-        ejerciciosRealizados.value = dataEval.ejercicios_realizados || ''
-        observacionesEval.value = dataEval.observaciones || ''
-      }
-    } else {
-      notasEvolucion.value = dataSesion.notas_evolucion || ''
-      indicaciones.value = dataSesion.indicaciones || ''
-    }
+    // NOTA TECH LEAD: Hemos eliminado la carga de Evaluacion_inicial aquí.
+    // De eso se encarga ahora tu FichaEvaluacionInicial internamente.
 
   } catch (err) {
     showAlert('Error al cargar expediente: ' + err.message, 'error')
@@ -114,60 +127,6 @@ const calcularEdad = (fechaNacimiento) => {
   const m = hoy.getMonth() - nac.getMonth()
   if (m < 0 || (m === 0 && hoy.getDate() < nac.getDate())) edad--
   return `${edad} años`
-}
-
-const guardarAtencion = async () => {
-  saving.value = true
-  try {
-    if (isEvaluacion.value) {
-      // ── GUARDADO DE EVALUACIÓN INICIAL ──
-      const payloadEvaluacion = {
-        idPaciente: sesion.value.idPaciente,
-        idFisioterapeuta: sesion.value.idFisioterapeuta,
-        fecha: new Date().toISOString(),
-        motivo_consulta: motivoConsulta.value.trim(),
-        apuntes_generales: apuntesGenerales.value.trim(),
-        ejercicios_realizados: ejerciciosRealizados.value.trim() || null,
-        observaciones: observacionesEval.value.trim() || null,
-        idSesion: sesion.value.idSesion,
-        idTratamiento: sesion.value.idTratamiento || null
-      }
-
-      if (idEvaluacion.value) {
-        const { error } = await supabase.from('Evaluacion_inicial').update(payloadEvaluacion).eq('idEvaluacionInicial', idEvaluacion.value)
-        if (error) throw error
-      } else {
-        const { error } = await supabase.from('Evaluacion_inicial').insert(payloadEvaluacion)
-        if (error) throw error
-      }
-
-      // ✅ CAMBIO DE ESTADO A 'ATENDIDA' TRAS GUARDAR LA EVALUACIÓN
-      const { error: errUpdateSesion } = await supabase
-        .from('Sesion')
-        .update({ estado: 'atendida' })
-        .eq('idSesion', idSesion)
-      if (errUpdateSesion) throw errUpdateSesion
-
-    } else {
-      // ── GUARDADO DE SESIÓN DE TRATAMIENTO Y CAMBIO DE ESTADO ──
-      const { error } = await supabase
-        .from('Sesion')
-        .update({
-          notas_evolucion: notasEvolucion.value.trim(),
-          indicaciones: indicaciones.value.trim(),
-          estado: 'atendida' // ✅ CAMBIO DE ESTADO AQUÍ
-        })
-        .eq('idSesion', idSesion)
-      if (error) throw error
-    }
-
-    showAlert('📝 Registro clínico guardado y sesión finalizada.', 'success')
-    router.push('/citas')
-  } catch (err) {
-    showAlert('Error al guardar: ' + err.message, 'error')
-  } finally {
-    saving.value = false
-  }
 }
 
 const guardarAntecedentes = async () => {
@@ -198,9 +157,21 @@ const guardarAntecedentes = async () => {
   }
 }
 
-onMounted(() => {
-  cargarSesionClinica()
-})
+// Escucha el evento de completado desde cualquiera de los dos componentes hijos
+const finalizarAtencion = async () => {
+  try {
+    // Por si el componente no cambió el estado, lo forzamos aquí a modo de seguro
+    await supabase.from('Sesion').update({ estado: 'atendida' }).eq('idSesion', idSesion)
+    showAlert('📝 Registro clínico guardado y sesión finalizada.', 'success')
+    router.push('/citas')
+  } catch (err) {
+    showAlert('Error al cambiar el estado de la cita.', 'error')
+  }
+}
+
+const mostrarFichaHistorica = () => { verFichaHistorica.value = true }
+
+onMounted(() => { cargarSesionClinica() })
 </script>
 
 <template>
@@ -213,7 +184,7 @@ onMounted(() => {
           {{ isEvaluacion ? 'Diagnóstico y evaluación inicial del paciente.' : 'Evolución y seguimiento de la sesión actual.' }}
         </p>
       </div>
-      <button class="btn-secondary" @click="router.push('/citas')" :disabled="saving">
+      <button class="btn-secondary" @click="router.push('/citas')">
         &larr; Volver a la Agenda
       </button>
     </div>
@@ -223,7 +194,7 @@ onMounted(() => {
       Cargando expediente...
     </div>
 
-    <div v-else class="form-grid span-2" style="grid-template-columns: 1fr 2fr; gap: 24px; align-items: start;">
+    <div v-else class="form-grid span-2" style="grid-template-columns: 1fr 2.5fr; gap: 24px; align-items: start;">
 
       <div class="data-card" style="padding: 20px; position: sticky; top: 20px;">
         <div
@@ -249,8 +220,8 @@ onMounted(() => {
           <p style="margin: 0;">
             <strong>Tipo de Cita: </strong>
             <span
-              :style="{ color: isEvaluacion ? '#0f766e' : 'var(--blue)', fontWeight: '600', textTransform: 'capitalize' }">
-              {{ isEvaluacion ? 'Evaluación Inicial' : 'Sesión de Tratamiento' }}
+              :style="{ color: isEvaluacion ? '#0f766e' : (isMasaje ? '#d97706' : 'var(--blue)'), fontWeight: '600', textTransform: 'capitalize' }">
+              {{ isEvaluacion ? 'Evaluación Inicial' : (isMasaje ? 'Sesión de Masajes' : 'Sesión de Tratamiento') }}
             </span>
           </p>
           <p v-if="!isEvaluacion" style="margin: 0;"><strong>Sesión N°:</strong> {{ sesion.numero_sesion }}</p>
@@ -261,111 +232,109 @@ onMounted(() => {
           @click="showModalAntecedentes = true">
           📋 Ver / Editar Antecedentes
         </button>
+
+        <button type="button" class="btn-secondary"
+          style="width: 100%; margin-top: 10px; display: flex; justify-content: center; gap: 8px; background: #ccfbf1; color: #0f766e; border-color: #99f6e4;"
+          @click="router.push({ name: 'HistoriaClinica', params: { idPaciente: sesion.idPaciente } })">
+          📚 Ver Historial Completo
+        </button>
       </div>
 
       <div class="data-card" style="padding: 24px;">
-        <form @submit.prevent="guardarAtencion" style="display: flex; flex-direction: column; gap: 20px;">
 
-          <template v-if="isEvaluacion">
-            <div class="input-group">
-              <label>Motivo de Consulta <span class="req">*</span></label>
-              <textarea v-model="motivoConsulta" rows="3"
-                placeholder="Síntomas principales, zona de dolor, tiempo de evolución..." required></textarea>
-            </div>
+        <FichaEvaluacionInicial v-if="isEvaluacion" :idSesion="sesion.idSesion" :idTratamiento="sesion.idTratamiento"
+          :idPaciente="sesion.idPaciente" :idFisioterapeuta="sesion.idFisioterapeuta" @completado="finalizarAtencion" />
 
-            <div class="input-group">
-              <label>Apuntes Generales (Anamnesis / Exploración Física) <span class="req">*</span></label>
-              <textarea v-model="apuntesGenerales" rows="5"
-                placeholder="Postura, rango de movimiento, fuerza muscular, pruebas especiales..." required></textarea>
-            </div>
-
-            <div class="form-grid">
-              <div class="input-group">
-                <label>Ejercicios Realizados en Evaluación (Opcional)</label>
-                <textarea v-model="ejerciciosRealizados" rows="3"
-                  placeholder="Ejercicios de prueba de tolerancia..."></textarea>
-              </div>
-              <div class="input-group">
-                <label>Observaciones Adicionales (Opcional)</label>
-                <textarea v-model="observacionesEval" rows="3"
-                  placeholder="Alergias, recomendaciones preventivas..."></textarea>
-              </div>
-            </div>
-          </template>
-
-          <template v-else>
-            <div class="input-group">
-              <label>Notas de Evolución (SOAP / Procedimientos realizados) <span class="req">*</span></label>
-              <textarea v-model="notasEvolucion" rows="6"
-                placeholder="Describa el progreso del paciente, técnicas aplicadas y respuesta al tratamiento..."
-                required></textarea>
-            </div>
-
-            <div class="input-group">
-              <label>Indicaciones para el hogar (Opcional)</label>
-              <textarea v-model="indicaciones" rows="4"
-                placeholder="Ej: Reposo relativo, aplicación de compresas frías por 15 min..."></textarea>
-            </div>
-          </template>
-
+        <div v-else-if="isMasaje" class="masaje-atencion-box">
           <div
-            style="display: flex; justify-content: flex-end; margin-top: 10px; border-top: 1px solid var(--gray-100); padding-top: 20px;">
-            <button type="submit" class="primary-btn" :disabled="saving"
-              style="background: #10b981; padding: 12px 24px;">
-              <span v-if="saving" class="btn-spinner"></span>
-              <span v-else>💾 Guardar y Finalizar Sesión</span>
-            </button>
+            style="display: flex; align-items: center; gap: 12px; margin-bottom: 24px; padding-bottom: 12px; border-bottom: 1px solid #e2e8f0;">
+            <span style="font-size: 28px;">💆</span>
+            <div>
+              <h3 style="margin: 0; font-size: 18px; color: #d97706; font-weight: 700;">Atención de Sesión de Masajes
+              </h3>
+              <p style="margin: 0; font-size: 13px; color: var(--gray-500);">Registro rápido y simplificado para masajes
+                independientes</p>
+            </div>
           </div>
 
-        </form>
-      </div>
+          <div style="display: flex; flex-direction: column; gap: 20px;">
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+              <label style="font-size: 14px; font-weight: 600; color: #334155;">Tipo de Masaje Realizado <span
+                  style="color: #ef4444;">*</span></label>
+              <input type="text"
+                style="width: 100%; padding: 10px 14px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px;"
+                placeholder="Ej: Relajante, Descontracturante, Deportivo, Drenaje..." v-model="tipoMasaje" />
+            </div>
 
+            <div style="display: flex; flex-direction: column; gap: 8px;">
+              <label style="font-size: 14px; font-weight: 600; color: #334155;">Comentarios u Observaciones
+                Adicionales</label>
+              <textarea
+                style="width: 100%; padding: 10px 14px; border: 1px solid #cbd5e1; border-radius: 8px; font-size: 14px; resize: vertical;"
+                rows="6" placeholder="Escriba aquí los detalles observados durante la sesión de masaje..."
+                v-model="comentarioMasaje"></textarea>
+            </div>
+
+            <div
+              style="display: flex; justify-content: flex-end; margin-top: 10px; border-top: 1px solid #e2e8f0; padding-top: 20px;">
+              <button type="button"
+                style="background: #d97706; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 8px;"
+                @click="guardarAtencionMasaje" :disabled="savingMasaje || !tipoMasaje.trim()">
+                <span v-if="savingMasaje" class="spinner"></span>
+                <span v-else>💾 Registrar Atención de Masaje</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <FormularioEvolucion v-else :idSesion="sesion.idSesion" @guardado="finalizarAtencion"
+          @ver-ficha-inicial="mostrarFichaHistorica" />
+
+      </div>
     </div>
 
-    <!-- ── MODAL: ANTECEDENTES CLÍNICOS ── -->
+    <Transition name="fade-modal">
+      <div v-if="verFichaHistorica" class="modal-overlay" @click.self="verFichaHistorica = false">
+        <div class="modal-window" style="max-width: 900px; max-height: 90vh; display: flex; flex-direction: column;">
+          <div class="modal-header">
+            <h3>Ficha de Evaluación Inicial Original</h3>
+            <button class="close-x" @click="verFichaHistorica = false">&times;</button>
+          </div>
+          <div class="modal-form" style="overflow-y: auto; padding: 20px;">
+            <FichaEvaluacionInicial :idTratamiento="sesion.idTratamiento" :idPaciente="sesion.idPaciente"
+              :modoLectura="true" />
+          </div>
+          <div class="modal-actions" style="padding: 15px; border-top: 1px solid #eee;">
+            <button class="btn-secondary" @click="verFichaHistorica = false">Cerrar Ficha</button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+
     <Transition name="fade-modal">
       <div v-if="showModalAntecedentes" class="modal-overlay" @click.self="showModalAntecedentes = false">
         <div class="modal-window" style="max-width: 600px; max-height: 90vh; display: flex; flex-direction: column;">
-
           <div class="modal-header">
             <h3>Historial Médico y Antecedentes</h3>
             <button class="close-x" @click="showModalAntecedentes = false"
               :disabled="savingAntecedentes">&times;</button>
           </div>
-
           <div class="modal-form" style="overflow-y: auto; padding-right: 8px;">
             <form @submit.prevent="guardarAntecedentes" style="display: flex; flex-direction: column; gap: 16px;">
-
               <div class="input-group">
                 <label style="color: #991b1b; font-weight: 700;">Alergias Relevantes (Medicamentos, materiales,
                   etc.)</label>
                 <textarea v-model="antecedentes.alergias" rows="2"
                   placeholder="Ej: Alergia al látex, paracetamol..."></textarea>
               </div>
-
-              <div class="input-group">
-                <label>Antecedentes Quirúrgicos</label>
-                <textarea v-model="antecedentes.quirurgicos" rows="2"
-                  placeholder="Cirugías previas, implantes, material de osteosíntesis..."></textarea>
-              </div>
-
-              <div class="input-group">
-                <label>Antecedentes Traumatológicos</label>
-                <textarea v-model="antecedentes.traumatologicos" rows="2"
-                  placeholder="Fracturas, esguinces crónicos, luxaciones..."></textarea>
-              </div>
-
-              <div class="input-group">
-                <label>Antecedentes Familiares</label>
-                <textarea v-model="antecedentes.familiares" rows="2"
-                  placeholder="Enfermedades hereditarias, artritis reumatoide..."></textarea>
-              </div>
-
-              <div class="input-group">
-                <label>Observaciones / Enfermedades Crónicas</label>
-                <textarea v-model="antecedentes.observaciones" rows="2"
-                  placeholder="Hipertensión, diabetes, marcapasos..."></textarea>
-              </div>
+              <div class="input-group"><label>Antecedentes Quirúrgicos</label><textarea
+                  v-model="antecedentes.quirurgicos" rows="2"></textarea></div>
+              <div class="input-group"><label>Antecedentes Traumatológicos</label><textarea
+                  v-model="antecedentes.traumatologicos" rows="2"></textarea></div>
+              <div class="input-group"><label>Antecedentes Familiares</label><textarea v-model="antecedentes.familiares"
+                  rows="2"></textarea></div>
+              <div class="input-group"><label>Observaciones / Enfermedades Crónicas</label><textarea
+                  v-model="antecedentes.observaciones" rows="2"></textarea></div>
 
               <div class="modal-actions"
                 style="position: sticky; bottom: -20px; background: white; padding-top: 10px; border-top: 1px solid #eee;">
@@ -376,45 +345,11 @@ onMounted(() => {
                   <span v-else>💾 Guardar Antecedentes</span>
                 </button>
               </div>
-
             </form>
           </div>
         </div>
       </div>
     </Transition>
+
   </div>
 </template>
-
-<style scoped>
-.req {
-  color: #ef4444;
-}
-
-textarea {
-  font-size: 14px;
-  line-height: 1.5;
-  resize: vertical;
-}
-
-@media (max-width: 768px) {
-  .span-2 {
-    grid-template-columns: 1fr !important;
-  }
-}
-
-/* Asegura que el contenedor principal esté bien alineado */
-.form-grid {
-  display: grid;
-  grid-template-columns: 1fr 2fr;
-  gap: 24px;
-  align-items: start;
-  /* <--- Esto es clave para que la tarjeta no se estire */
-}
-
-/* Mejora la tarjeta fija */
-.data-card {
-  /* Añade esto si sientes que queda muy pegada al borde superior */
-  top: 80px;
-  /* Ajusta según la altura de tu navbar superior */
-}
-</style>

@@ -122,8 +122,13 @@ export function useCitas() {
         try {
             // Consultamos la vista unificada
             let query = supabase.from('vw_citas_detalladas')
-                .select('idSesion, fecha_hora, estado, tipo, paciente_en_sala, estado_pago, fisio_nombres, fisio_apellidos, fisio_especialidad, paciente_nombres, paciente_apellidos, idPaciente, idFisioterapeuta, idPaquete, idTratamiento, expires_at')
-
+                .select(`
+                    idSesion, fecha_hora, estado, tipo, idTratamiento, paciente_en_sala, 
+                    estado_pago, fisio_nombres, idSesionOriginal, fisio_apellidos, 
+                    fisio_especialidad, paciente_nombres, paciente_apellidos, paciente_celular, 
+                    idPaciente, idFisioterapeuta, idPaquete, expires_at, 
+                    tratamiento_finalizado, paquete_tiene_deuda 
+                `) // 👈 Agregado al final
             // ✅ SEGURIDAD: Solo filtrar por userId si está confirmado
             if (esPaciente.value && userId.value) {
                 query = query.eq('idPaciente', userId.value)
@@ -310,31 +315,27 @@ export function useCitas() {
         return mapas[modalidad] || 'evaluacion';
     };
 
-    // ── crearCita ───────────────────────────────────────────────────────────────
-    // ── crearCita (Ciclos Clínicos) ──────────────────────────────────────────────
     // ── crearCita (Ciclos Clínicos con RPC y Lote) ──────────────────────────────
     const crearCita = async (payload) => {
         const {
             idPaciente,
             idFisioterapeuta,
             fecha_hora,
-            modalidad,                  // Viene de Vue: 'evaluacion_inicial' | 'tratamiento' | 'masaje'
-            sesionesOpcionales = [],    // Fechas adicionales seleccionadas en lote
-            idTratamientoExistente = null, // (Escenario B)
-            idEvaluacionSesion = null,     // (Escenario A)
+            modalidad,
+            sesionesOpcionales = [],
+            idTratamientoExistente = null,
+            idEvaluacionSesion = null,
             observaciones = null,
-            tratamientoConfig = {}      // Aquí viene { sesionesDeseadas, tamanoPaquete, etc. }
+            tratamientoConfig = {}
         } = payload
 
         if (!idPaciente) { showAlert('Debe seleccionar un paciente.', 'error'); return false }
         if (!idFisioterapeuta) { showAlert('Debe seleccionar un fisioterapeuta.', 'error'); return false }
-
-        // Si no viene de una evaluación previa (que ya tiene fecha), la fecha_hora es obligatoria
         if (!fecha_hora && !idEvaluacionSesion) {
             showAlert('Debe seleccionar fecha y hora.', 'error'); return false
         }
 
-        // Verificamos disponibilidad solo si se va a agendar una cita principal ahora mismo
+        // 1. Verificación de disponibilidad
         if (fecha_hora) {
             const slotOcupado = await verificarDisponibilidad(idFisioterapeuta, fecha_hora)
             if (slotOcupado) {
@@ -344,8 +345,13 @@ export function useCitas() {
         }
 
         loadingAccion.value = true
+
+        const idServicioCatalogo = tratamientoConfig?.idServicioSuelta || null;
+        let id_tratamiento = null;
+        let monto_total = 0;
+
         try {
-            // ── 1. Caso simple: Solo Evaluación Inicial ─────────────────────
+            // ── CASO A: Solo Evaluación Inicial (Gratis) ─────────────────────
             if (modalidad === 'evaluacion_inicial') {
                 const { data: sesion, error } = await supabase
                     .from('Sesion')
@@ -353,10 +359,12 @@ export function useCitas() {
                         idPaciente,
                         idFisioterapeuta,
                         fecha_hora,
-                        estado: 'agendada', // Nace confirmada porque es gratis
-                        estado_pago: 'cortesía',
-                        tipo: 'evaluacion',
+                        idTratamiento: null,
+                        idServicio: idServicioCatalogo,
                         es_evaluacion_inicial: true,
+                        tipo: 'evaluacion',
+                        estado: 'reservada',
+                        estado_pago: 'cortesía',
                         numero_sesion: 1,
                         observaciones,
                         expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
@@ -369,36 +377,58 @@ export function useCitas() {
                 return sesion
             }
 
-            // ── 2. Caso 'tratamiento' o 'masaje': Llamar al RPC ─────────────
+            // ── CASO B: Tratamiento Físico o Masajes (Con Cobro) ─────────────────────
             const sesionesSolicitadas = tratamientoConfig.sesionesDeseadas || 0;
-            if (sesionesSolicitadas < 1) {
-                showAlert('Indique la cantidad de sesiones a contratar.', 'error')
-                return false
+
+            // 1. Lógica Financiera (Solo creamos Tratamiento Global si NO es masaje)
+            if (modalidad === 'tratamiento') {
+                const { data: ventaData, error: errVenta } = await supabase.rpc('vender_tratamiento', {
+                    p_id_paciente: idPaciente,
+                    p_id_fisioterapeuta: idFisioterapeuta,
+                    p_modalidad: 'tratamiento',
+                    p_sesiones_solicitadas: sesionesSolicitadas,
+                    p_id_tratamiento_existente: idTratamientoExistente,
+                    p_id_evaluacion_sesion: idEvaluacionSesion,
+                    p_motivo_consulta: observaciones,
+                    p_diagnostico: null,
+                    p_nombre_paquete: tratamientoConfig.nombrePaquete || 'Paquete',
+                    p_nombre_sueltas: tratamientoConfig.nombreSuelta || 'Sesión Suelta',
+                    p_precio_sueltas: tratamientoConfig.precioSuelta || 0
+                })
+
+                if (errVenta) throw errVenta
+
+                // Si es tratamiento, guardamos los IDs financieros
+                id_tratamiento = ventaData[0].id_tratamiento;
+                monto_total = ventaData[0].monto_total;
+            } else {
+                // Es un MASAJE: Se cobra como sesión suelta, sin tratamiento global
+                monto_total = (tratamientoConfig.precioSuelta || 0) * (sesionesOpcionales.length + (fecha_hora ? 1 : 0));
+                id_tratamiento = null; // Garantizamos la independencia
             }
 
-            // Adaptamos el string para que el RPC lo entienda según su lógica interna
-            const modalidadDB = modalidad === 'masaje' ? 'masajes' : modalidad;
+            // 2. Correlativos (Solo aplica si hay un Tratamiento activo)
+            let correlativoActual = 0;
+            if (id_tratamiento && (idTratamientoExistente || idEvaluacionSesion)) {
+                const { data: maxSesion } = await supabase
+                    .from('Sesion')
+                    .select('numero_sesion')
+                    .eq('idTratamiento', id_tratamiento)
+                    .order('numero_sesion', { ascending: false })
+                    .limit(1)
+                    .single();
 
-            const { data: ventaData, error: errVenta } = await supabase.rpc('vender_tratamiento', {
-                p_id_paciente: idPaciente,
-                p_id_fisioterapeuta: idFisioterapeuta,
-                p_modalidad: modalidadDB,
-                p_sesiones_solicitadas: sesionesSolicitadas,
-                p_id_tratamiento_existente: idTratamientoExistente,
-                p_id_evaluacion_sesion: idEvaluacionSesion,
-                p_motivo_consulta: observaciones,
-                p_diagnostico: null, // Se llenará en consulta médica
-            })
-
-            if (errVenta) throw errVenta
-            const { id_tratamiento, combinacion, monto_total } = ventaData[0]
+                if (maxSesion && maxSesion.numero_sesion) {
+                    correlativoActual = maxSesion.numero_sesion;
+                }
+            }
 
             let sesionPrincipal = null;
 
-            // ── 3. Agendar la cita principal (Si no es un anclaje puro) ─────
+            // ── 3. Agendar cita principal ─────────────────────
             if (fecha_hora) {
-                // Lógica de deuda: Si cobra y no agendó opcionales, la deuda se queda aquí
                 const heredaDeuda = monto_total > 0 && sesionesOpcionales.length === 0;
+                const esNuevaEvaluacion = modalidad === 'tratamiento' && !idTratamientoExistente && !idEvaluacionSesion;
 
                 const { data: sesion, error: errSesion } = await supabase
                     .from('Sesion')
@@ -407,11 +437,12 @@ export function useCitas() {
                         idFisioterapeuta,
                         fecha_hora,
                         idTratamiento: id_tratamiento,
-                        es_evaluacion_inicial: modalidad === 'tratamiento',
-                        estado: heredaDeuda ? 'reservada' : 'agendada',
+                        idServicio: idServicioCatalogo, // 👈 CRÍTICO: Catálogo enlazado
+                        es_evaluacion_inicial: esNuevaEvaluacion,
+                        tipo: modalidad === 'masaje' ? 'masaje' : (esNuevaEvaluacion ? 'evaluacion' : 'tratamiento_control'),
+                        estado: 'reservada',
                         estado_pago: heredaDeuda ? 'pendiente' : (modalidad === 'masaje' ? 'pendiente' : 'cortesía'),
-                        tipo: modalidad === 'masaje' ? 'masaje' : 'evaluacion',
-                        numero_sesion: idTratamientoExistente ? null : 1,
+                        numero_sesion: correlativoActual + 1,
                         observaciones,
                         expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
                     })
@@ -427,30 +458,26 @@ export function useCitas() {
                 const sesionesData = sesionesOpcionales.map((fechaIsoHora, index) => ({
                     idPaciente,
                     idFisioterapeuta,
-                    idTratamiento: id_tratamiento,
-                    es_evaluacion_inicial: false,
                     fecha_hora: fechaIsoHora,
-                    estado: 'reservada', // Siempre reservadas hasta que paciente confirme asistencia
+                    idTratamiento: id_tratamiento,
+                    idServicio: idServicioCatalogo, // 👈 CRÍTICO: Catálogo enlazado
+                    es_evaluacion_inicial: false,
                     tipo: modalidad === 'masaje' ? 'masaje' : 'tratamiento_control',
-                    numero_sesion: (idTratamientoExistente || idEvaluacionSesion) ? null : index + 2,
+                    estado: 'reservada',
+                    numero_sesion: correlativoActual + 2 + index,
                     observaciones: 'Agendada en lote.',
-                    // La primera de la lista recibe la deuda general del paquete/tratamiento
-                    estado_pago: (index === 0 && monto_total > 0) ? 'pendiente' : 'pagado'
+                    estado_pago: 'pendiente' // Siempre nacen en pendiente hasta que paguen
                 }));
 
                 const { error: errSesiones } = await supabase.from('Sesion').insert(sesionesData);
                 if (errSesiones) throw errSesiones;
             }
 
-            showAlert(`✅ ${idEvaluacionSesion ? 'Tratamiento anclado' : 'Operación exitosa'}: S/ ${monto_total.toFixed(2)}`, 'success')
-            return { sesion: sesionPrincipal, id_tratamiento, combinacion, monto_total }
+            showAlert(`✅ Operación exitosa.`, 'success')
+            return { sesion: sesionPrincipal, id_tratamiento, monto_total }
 
         } catch (err) {
-            if (err.code === 'P0001') {
-                showAlert('Regla de negocio: ' + err.message, 'error')
-            } else {
-                showAlert('Error al registrar: ' + (err.message || err.hint), 'error')
-            }
+            showAlert('Error al registrar: ' + (err.message || err.hint), 'error')
             return false
         } finally {
             loadingAccion.value = false
@@ -494,6 +521,9 @@ export function useCitas() {
                 p_id_evaluacion_sesion: null, // Es recarga, no anclaje inicial
                 p_motivo_consulta: null,
                 p_diagnostico: null,
+                p_nombre_paquete: payload.tratamientoConfig.nombrePaquete,
+                p_nombre_sueltas: payload.tratamientoConfig.nombreSuelta, // 👈 Hay que asegurar que esto viaje
+                p_precio_sueltas: payload.tratamientoConfig.precioSuelta
             })
 
             if (error) throw error
@@ -565,55 +595,101 @@ export function useCitas() {
     }
 
     // ── confirmarPago ───────────────────────────────────────────────────────────
-    const confirmarPago = async ({ idSesion, idPaciente, monto, metodoPago, numeroOperacion, idPaquete = null }) => {
-        if (!metodoPago) { showAlert('Seleccione el método de pago.', 'error'); return false }
-        if (monto === null || monto === undefined || monto <= 0) { showAlert('Ingrese un monto válido.', 'error'); return false }
+    const confirmarPago = async ({
+        idSesion,
+        idPaciente,
+        monto,
+        metodoPago,
+        numeroOperacion,
+        idPaquete = null, // Volvemos a usar el controlador financiero
+        esPagoCompleto = false
+    }) => {
+        if (!metodoPago) {
+            showAlert('Seleccione el método de pago.', 'error');
+            return false;
+        }
+
+        // Bloqueo de seguridad: No se aceptan montos negativos
+        if (monto === null || monto === undefined || monto < 0) {
+            showAlert('Ingrese un monto válido.', 'error');
+            return false;
+        }
 
         loadingAccion.value = true
         try {
-            // 1. Insertar el pago
+            // ── CASO A: ES UNA SESIÓN GRATUITA (Monto 0) ──
+            if (monto === 0) {
+                // No tocamos la tabla Pago para no violar el CONSTRAINT monto > 0.00
+                const { error: errSesion } = await supabase
+                    .from('Sesion')
+                    .update({ estado_pago: 'pagado', expires_at: null })
+                    .eq('idSesion', idSesion);
+
+                if (errSesion) throw errSesion;
+
+                showAlert('✅ Visita gratuita registrada correctamente.', 'success');
+                return true;
+            }
+
+            // ── CASO B: HAY COBRO REAL EN CAJA (Monto > 0) ──
+            // 1. Insertamos en Pago (El trigger actualizará el Paquete automáticamente)
             const { error: errPago } = await supabase
                 .from('Pago')
                 .insert({
                     idPaciente,
-                    idSesion: idPaquete ? null : idSesion,
+                    idSesion: idSesion,
                     idPaquete: idPaquete || null,
                     monto,
                     metodo_pago: metodoPago,
                     numero_operacion: numeroOperacion || null,
                     estado_pago: 'completado',
-                })
-            if (errPago) throw errPago
+                });
 
-            // 2. Actualizar la sesión
-            // OJO: Si pagas un paquete, el TRIGGER actualizará el Paquete. 
-            // Pero la sesión específica también debe marcarse como pagada si era individual.
+            if (errPago) throw errPago;
 
-            const payloadSesion = { expires_at: null };
+            // 2. Lógica Inteligente de Actualización Masiva
+            if (idPaquete) {
+                if (esPagoCompleto) {
+                    // Actualizamos todas las citas atadas a este PAQUETE FINANCIERO
+                    const { error: errUpdateMasivo } = await supabase
+                        .from('Sesion')
+                        .update({ estado_pago: 'pagado', expires_at: null })
+                        .eq('idPaquete', idPaquete)
+                        .in('estado_pago', ['pendiente', 'parcial']);
 
-            // Si no es un paquete, la sesión en sí misma queda pagada.
-            if (!idPaquete) {
-                payloadSesion.estado_pago = 'pagado';
-            }
+                    if (errUpdateMasivo) throw errUpdateMasivo;
+                } else {
+                    const { error: errUpdateParcial } = await supabase
+                        .from('Sesion')
+                        .update({ estado_pago: 'parcial', expires_at: null })
+                        .eq('idSesion', idSesion);
 
-            const { error: errSesion } = await supabase
-                .from('Sesion')
-                .update(payloadSesion)
-                .eq('idSesion', idSesion)
-
-            if (errSesion) throw errSesion
-
-            showAlert('✅ Pago registrado correctamente.', 'success')
-            return true
-        } catch (err) {
-            if (err.code === 'P0001') {
-                showAlert('Regla de negocio: ' + err.message, 'error')
+                    if (errUpdateParcial) throw errUpdateParcial;
+                }
             } else {
-                showAlert('Error al confirmar el pago: ' + err.message, 'error')
+                const nuevoEstadoPago = esPagoCompleto ? 'pagado' : 'parcial';
+                // Sesión suelta normal
+                const { error: errSesion } = await supabase
+                    .from('Sesion')
+                    .update({ estado_pago: nuevoEstadoPago, expires_at: null })
+                    .eq('idSesion', idSesion);
+
+                if (errSesion) throw errSesion;
             }
-            return false
+
+            showAlert(`✅ Pago de S/ ${monto.toFixed(2)} registrado en caja.`, 'success');
+            return true;
+
+        } catch (err) {
+            if (err.code === 'P0001' || err.code === '23514') {
+                // 23514 es el código de PostgreSQL para violaciones de Check Constraint
+                showAlert('Regla de base de datos: ' + err.message, 'error');
+            } else {
+                showAlert('Error al confirmar el pago: ' + err.message, 'error');
+            }
+            return false;
         } finally {
-            loadingAccion.value = false
+            loadingAccion.value = false;
         }
     }
 
@@ -776,6 +852,23 @@ export function useCitas() {
 
         loadingAccion.value = true
         try {
+            // ── 👇 CANDADO DE ÚNICA REPROGRAMACIÓN 👇 ──
+            // Consultamos en vivo si la cita actual ya proviene de otra original
+            const { data: sesionActual, error: errCheck } = await supabase
+                .from('Sesion')
+                .select('idSesionOriginal')
+                .eq('idSesion', idSesion)
+                .single()
+
+            if (errCheck) throw errCheck
+
+            // Si ya cuenta con un "padre", significa que ya se usó su oportunidad de cambio
+            if (sesionActual?.idSesionOriginal) {
+                showAlert('Regla de la Clínica: Esta cita ya fue reprogramada una vez y no admite más cambios.', 'error')
+                return false
+            }
+            // ───────────────────────────────────────────
+
             // Una sola llamada — toda la lógica vive en Postgres, atómica y con rollback automático
             const { data: nuevaId, error } = await supabase.rpc('reprogramar_sesion', {
                 p_id_sesion: idSesion,

@@ -2,9 +2,15 @@
 import { ref, onMounted, computed } from 'vue'
 import { supabase } from '@/lib/supabaseClient'
 import { useAlert } from '@/composables/useAlert'
+import { useRouter } from 'vue-router'
 import FormularioPacienteModal from '@/components/FormularioPacienteModal.vue'
 
 const { showAlert, showConfirm } = useAlert()
+const router = useRouter()
+
+const irAHistoriaClinica = (id) => {
+  router.push({ name: 'HistoriaClinica', params: { idPaciente: id } })
+}
 
 // Estados operativos
 const pacientesList = ref([])
@@ -51,18 +57,18 @@ const filteredPacientes = computed(() => {
 
 // Controladores de Apertura Dinámica
 const openCreateForm = () => {
-    selectedPaciente.value = null 
+    selectedPaciente.value = null
     isModalOpen.value = true
 }
 
 const openEditForm = (paciente) => {
-    selectedPaciente.value = paciente 
+    selectedPaciente.value = paciente
     isModalOpen.value = true
 }
 
 const handleDeletePaciente = async (idPersonaReal) => {
     const confirmado = await showConfirm('¿Estás seguro de eliminar este paciente? Esto borrará permanentemente sus accesos al sistema y su historial.')
-    
+
     if (!confirmado) return
 
     try {
@@ -74,7 +80,7 @@ const handleDeletePaciente = async (idPersonaReal) => {
         if (error) throw error
 
         showAlert('Se elimnó al paciente del sistema. ', 'success')
-        await fetchPacientes() 
+        await fetchPacientes()
     } catch (error) {
         showAlert('No se pudo eliminar el registro: ' + error.message, 'error')
     }
@@ -132,6 +138,10 @@ onMounted(() => {
                             <td>{{ paciente.Persona?.celular || '-' }}</td>
                             <td>{{ paciente.direccion || '-' }}</td>
                             <td>
+                                <button @click="irAHistoriaClinica(paciente.idPaciente)" class="btn-secondary"
+                                style="padding: 6px 14px; font-size: 12px; border-radius: 6px; margin-right: 8px; background: #ccfbf1; color: #0f766e">
+                                    <i class="icono-historia"></i> Ver Historia Clínica
+                                </button>
                                 <button @click="openEditForm(paciente)" class="btn-secondary"
                                     style="padding: 6px 14px; font-size: 12px; border-radius: 6px; margin-right: 8px;">
                                     Editar
@@ -150,12 +160,8 @@ onMounted(() => {
             </div>
         </div>
 
-        <FormularioPacienteModal 
-            :is-open="isModalOpen" 
-            :paciente-data="selectedPaciente" 
-            @close="isModalOpen = false"
-            @refresh="fetchPacientes" 
-        />
+        <FormularioPacienteModal :is-open="isModalOpen" :paciente-data="selectedPaciente" @close="isModalOpen = false"
+            @refresh="fetchPacientes" />
     </div>
 </template>
 

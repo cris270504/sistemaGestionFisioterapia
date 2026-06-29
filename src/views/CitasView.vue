@@ -86,6 +86,7 @@ const citasDelDia = (dia) => {
 const formatSoloHora = (iso) => new Intl.DateTimeFormat('es-PE', { hour: '2-digit', minute: '2-digit' }).format(new Date(iso))
 const nombrePacienteFlat = (sesion) => `${sesion?.paciente_nombres || ''} ${sesion?.paciente_apellidos || ''}`.trim() || '—';
 const nombreFisioFlat = (sesion) => `${sesion?.fisio_nombres || ''} ${sesion?.fisio_apellidos || ''}`.trim() || '—';
+const celularPacienteFlat = (sesion) => `${sesion?.paciente_celular || ''}`.trim() || '—';
 
 onMounted(async () => {
   await initUser()
@@ -195,6 +196,16 @@ const abrirModalNueva = async () => {
   showModalNueva.value = true
 }
 
+const tratamientoParaRecargar = ref(null)
+
+const verHistorialClinico = (sesion) => {
+  if (sesion && sesion.idPaciente) {
+    router.push({ name: 'HistoriaClinica', params: { idPaciente: sesion.idPaciente } })
+  } else {
+    showAlert('No se pudo identificar al paciente.', 'error')
+  }
+}
+
 const handleAtender = (sesion) => {
   router.push({ name: 'atencion', params: { idSesion: sesion.idSesion } })
 }
@@ -211,36 +222,85 @@ const handleConfirmarAsistencia = async (sesion) => {
 const accionesDe = (sesion) => {
   const e = sesion?.estado;
   const enSala = !!sesion?.paciente_en_sala;
+  const esMasaje = sesion?.tipo === 'masaje';
 
-  // ✅ IDENTIFICADOR DE GRATUIDAD:
-  // Es gratis estrictamente si es tipo evaluación y no trae cargos adicionales 
-  // (ni paquetes, ni servicios extra, ni sesiones a generar).
-  const esGratis = sesion?.tipo === 'evaluacion' &&
-    !sesion?.idPaquete &&
-    !sesion?.idServicio &&
-    (!sesion?.sesiones_a_generar || sesion?.sesiones_a_generar === 0);
+  // Es una cita gratis SOLO si es evaluación y NO tiene un paquete asociado
+  const esEvaluacionSuelta = sesion?.tipo === 'evaluacion' && !sesion?.idPaquete;
 
-  // Un pago está pendiente si dice 'pendiente' o 'parcial', Y ADEMÁS no es una cita gratuita
-  const pagoPendiente = (sesion?.estado_pago === 'pendiente' || sesion?.estado_pago === 'parcial') && !esGratis;
+  // MUESTRA EL BOTÓN DE PAGO SI:
+  // 1. La sesión tiene deuda (pendiente / parcial)
+  // 2. O es la evaluación inicial de un paquete (permite cobrar la deuda global por adelantado)
+  const tieneDeudaIndividual = ['pendiente', 'parcial'].includes(sesion?.estado_pago) && sesion?.tipo !== 'evaluacion';
+  const esEvaluacionDePaquete = sesion?.tipo === 'evaluacion' && !!sesion?.idPaquete && sesion?.paquete_tiene_deuda;
+  
+  const mostrarBotonPago = (tieneDeudaIndividual || esEvaluacionDePaquete) && !esEvaluacionSuelta && sesion?.estado_pago !== 'pagado';
+
+  const yaFueReprogramada = !!(sesion?.idSesionOriginal || sesion?.id_sesion_original);
+  const tratamientoConcluido = !!sesion?.tratamiento_finalizado; 
 
   return {
-    // Solo en reservada
-    puedeConfirmarAsistencia: puedeGestionar.value && e === 'reservada' && sesion?.tipo === 'evaluacion',
-
-    // El pago se puede hacer si está reservada o agendada, y hay una deuda real
-    puedeConfirmarPago: puedeGestionar.value && ['reservada', 'agendada'].includes(e) && pagoPendiente,
-
-    // Check-in y faltó (solo si está agendada y aún no entra a sala)
+    puedeConfirmarAsistencia: puedeGestionar.value && e === 'reservada',
+    
+    // 👇 Aplicamos la nueva regla inteligente para el cobro
+    puedeConfirmarPago: puedeGestionar.value && ['reservada', 'agendada', 'atendida'].includes(e) && mostrarBotonPago,
+    
     puedeCheckIn: puedeGestionar.value && e === 'agendada' && !enSala,
     puedeInasistencia: puedeGestionar.value && e === 'agendada' && !enSala,
-
-    // Atender solo si está en sala y NO debe nada (o es gratis)
-    puedeAtender: esFisioterapeuta.value && e === 'agendada' && enSala && !pagoPendiente,
-
-    // Reprogramar y Cancelar (antes de que entre a sala)
-    puedeReprogramar: puedeGestionar.value && ['reservada', 'agendada'].includes(e) && !sesion?.idSesionOriginal && !enSala,
+    puedeAtender: esFisioterapeuta.value && e === 'agendada' && enSala && !tieneDeudaIndividual,
+    puedeReprogramar: puedeGestionar.value && ['reservada', 'agendada'].includes(e) && !yaFueReprogramada && !enSala,
     puedeCancelar: puedeGestionar.value && ['reservada', 'agendada'].includes(e) && !enSala,
+    puedeVerRegistro: e === 'atendida',
+    puedeAgregarSesiones: puedeGestionar.value && e === 'atendida' && !esMasaje && !tratamientoConcluido,
   }
+}
+
+// Estados para el nuevo modal de lectura
+const showModalRegistro = ref(false)
+const registroSeleccionado = ref(null)
+const loadingRegistro = ref(false)
+
+// Función para ver lo que escribió el fisio en esa cita específica
+const verRegistroSesion = async (sesion) => {
+  loadingRegistro.value = true;
+  showModalDetalle.value = false; // Cerramos detalle si estuviera abierto
+  showModalRegistro.value = true;
+
+  try {
+    // Consultamos los apuntes clínicos de esa sesión exacta
+    const { data, error } = await supabase
+      .from('Sesion')
+      .select('notas_evolucion, indicaciones, evolucion_clinica, es_evaluacion_inicial')
+      .eq('idSesion', sesion.idSesion)
+      .single();
+
+    if (error) throw error;
+
+    // Fusionamos los datos clínicos con los datos básicos de la sesión
+    registroSeleccionado.value = { ...sesion, ...data };
+  } catch (err) {
+    showAlert('No se pudieron cargar los apuntes clínicos.', 'error');
+    showModalRegistro.value = false;
+  } finally {
+    loadingRegistro.value = false;
+  }
+}
+
+// Función para agregar sesiones (Abre el modal de Nueva Cita pre-configurado)
+const handleAgregarSesiones = (sesion) => {
+  // Preparamos el objeto para inyectarlo en el modal
+  tratamientoParaRecargar.value = {
+    // Si la sesión ya tiene un tratamiento, es una recarga normal
+    idTratamiento: sesion.idTratamiento,
+
+    // 👇 NUEVO: Si no tiene tratamiento y es una evaluación, es un Anclaje
+    idEvaluacionSesion: (!sesion.idTratamiento && sesion.tipo === 'evaluacion') ? sesion.idSesion : null,
+
+    idPaciente: sesion.idPaciente,
+    nombrePaciente: nombrePacienteFlat(sesion),
+    idFisioterapeuta: sesion.idFisioterapeuta,
+    nombreFisio: nombreFisioFlat(sesion)
+  }
+  showModalNueva.value = true
 }
 
 const obtenerSituacionCita = (sesion) => {
@@ -254,6 +314,28 @@ const obtenerSituacionCita = (sesion) => {
   // 3. Si no es ninguna de las anteriores, es seguimiento
   return { label: 'Sesión de Seguimiento', color: '#64748b' };
 };
+
+// ── SISTEMA DE COLORES PARA TRATAMIENTOS (CICLOS) ──
+const PALETA_TRATAMIENTOS = [
+  '#ef4444', '#f97316', '#eab308', '#84cc16', '#22c55e', '#14b8a6',
+  '#06b6d4', '#0ea5e9', '#3b82f6', '#6366f1', '#8b5cf6', '#a855f7',
+  '#d946ef', '#ec4899', '#f43f5e'
+];
+
+const getColorTratamiento = (idTratamiento) => {
+  if (!idTratamiento) return '#94a3b8'; // Gris si es una sesión suelta o evaluación sin ciclo
+
+  // Convertimos el ID en un número (hash) para asegurar que siempre tenga el mismo color
+  let hash = 0;
+  const str = String(idTratamiento);
+  for (let i = 0; i < str.length; i++) {
+    hash = str.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  // Asignamos el color basado en el residuo
+  const index = Math.abs(hash) % PALETA_TRATAMIENTOS.length;
+  return PALETA_TRATAMIENTOS[index];
+};
+
 </script>
 
 <template>
@@ -331,6 +413,11 @@ const obtenerSituacionCita = (sesion) => {
                 <td v-if="columnas.includes('paciente')">
                   <span class="patient-name">{{ nombrePacienteFlat(sesion) }}</span>
                   <span v-if="sesion.paciente_celular" class="patient-detail">{{ sesion.paciente_celular }}</span>
+
+                  <div v-if="sesion.idTratamiento" class="tratamiento-pill"
+                    :style="`color: ${getColorTratamiento(sesion.idTratamiento)}; border-color: ${getColorTratamiento(sesion.idTratamiento)}40; background-color: ${getColorTratamiento(sesion.idTratamiento)}15`">
+                    🔗 Ciclo #{{ sesion.idTratamiento }}
+                  </div>
                 </td>
 
                 <td v-if="columnas.includes('fisioterapeuta')">
@@ -339,7 +426,8 @@ const obtenerSituacionCita = (sesion) => {
                 </td>
                 <td>
                   <span class="fecha-hora">{{ formatFechaHora(sesion.fecha_hora) }}</span>
-                  <span v-if="sesion.paciente_en_sala" class="sala-badge">🟢 En sala</span>
+                  <span v-if="sesion.paciente_en_sala && sesion.estado !== 'atendida'" class="sala-badge">🟢 En
+                    sala</span>
                   <span class="situacion-badge" :style="{ color: obtenerSituacionCita(sesion).color }">
                     {{ obtenerSituacionCita(sesion).label }}
                   </span>
@@ -354,6 +442,17 @@ const obtenerSituacionCita = (sesion) => {
                   <div class="acciones-cell">
                     <button v-if="accionesDe(sesion).puedeAtender" class="accion-btn atender"
                       @click="handleAtender(sesion)">🩺 Atender</button>
+                    <button v-if="accionesDe(sesion).puedeVerRegistro" class="accion-btn historial"
+                      @click="verRegistroSesion(sesion)">
+                      📄 Ver Registro
+                    </button>
+
+                    <!-- Botón para vender un paquete o agendar nueva cita -->
+                    <button v-if="accionesDe(sesion).puedeAgregarSesiones" class="accion-btn"
+                      style="background: #e0f2fe; color: #0284c7; border-color: #bae6fd;"
+                      @click="handleAgregarSesiones(sesion)">
+                      ➕ Agregar Sesiones
+                    </button>
                     <button v-if="accionesDe(sesion).puedeConfirmarAsistencia" class="accion-btn confirmar"
                       @click="handleConfirmarAsistencia(sesion)" :disabled="loadingAccion"
                       title="Confirmar asistencia por teléfono">📞 Confirmar</button>
@@ -400,6 +499,13 @@ const obtenerSituacionCita = (sesion) => {
               :style="`border-left-color: ${getEstadoInfo(cita.estado).color}`" @click="abrirDetalleCalendario(cita)">
               <span class="cita-time">{{ formatSoloHora(cita.fecha_hora) }}</span>
               <span class="cita-name">{{ nombrePacienteFlat(cita).split(' ')[0] }}</span>
+
+              <span v-if="cita.idTratamiento" class="cita-ciclo-mini"
+                :style="`color: ${getColorTratamiento(cita.idTratamiento)}; background: ${getColorTratamiento(cita.idTratamiento)}20`"
+                title="Pertenece al mismo tratamiento">
+                #{{ cita.idTratamiento }}
+              </span>
+
               <span class="situacion-dot" :style="`background: ${obtenerSituacionCita(cita).color}`"></span>
             </button>
           </div>
@@ -416,6 +522,13 @@ const obtenerSituacionCita = (sesion) => {
           </div>
           <div class="modal-form">
             <div class="detalle-info">
+              <p v-if="sesionSeleccionada.idTratamiento">
+                <strong>Tratamiento:</strong>
+                <span class="tratamiento-pill"
+                  :style="`color: ${getColorTratamiento(sesionSeleccionada.idTratamiento)}; border-color: ${getColorTratamiento(sesionSeleccionada.idTratamiento)}40; background-color: ${getColorTratamiento(sesionSeleccionada.idTratamiento)}15`">
+                  🔗 Ciclo #{{ sesionSeleccionada.idTratamiento }}
+                </span>
+              </p>
               <p><strong>Paciente:</strong> {{ nombrePacienteFlat(sesionSeleccionada) }}</p>
               <p><strong>Especialista:</strong> {{ nombreFisioFlat(sesionSeleccionada) }}</p>
               <p><strong>Fecha y Hora:</strong> {{ formatFechaHora(sesionSeleccionada.fecha_hora) }}</p>
@@ -433,8 +546,21 @@ const obtenerSituacionCita = (sesion) => {
 
             <div class="modal-actions" style="margin-top: 20px; justify-content: flex-start; flex-wrap: wrap;"
               v-if="puedeGestionar || esFisioterapeuta">
+
               <button v-if="accionesDe(sesionSeleccionada).puedeAtender" class="accion-btn atender"
                 @click="handleAtender(sesionSeleccionada)">🩺 Atender</button>
+
+              <button v-if="accionesDe(sesionSeleccionada).puedeVerRegistro" class="accion-btn historial"
+                @click="verRegistroSesion(sesionSeleccionada)">
+                📄 Ver Registro
+              </button>
+
+              <button v-if="accionesDe(sesionSeleccionada).puedeAgregarSesiones" class="accion-btn"
+                style="background: #e0f2fe; color: #0284c7; border-color: #bae6fd;"
+                @click="handleAgregarSesiones(sesionSeleccionada)">
+                ➕ Agregar Sesiones
+              </button>
+
               <button v-if="accionesDe(sesionSeleccionada).puedeConfirmarAsistencia" class="accion-btn confirmar"
                 @click="handleConfirmarAsistencia(sesionSeleccionada)">📞 Confirmar</button>
               <button v-if="accionesDe(sesionSeleccionada).puedeConfirmarPago" class="accion-btn pago"
@@ -443,7 +569,6 @@ const obtenerSituacionCita = (sesion) => {
                 @click="handleCheckIn(sesionSeleccionada)">✅ Check-in</button>
               <button v-if="accionesDe(sesionSeleccionada).puedeInasistencia" class="accion-btn inasistencia"
                 @click="handleInasistencia(sesionSeleccionada)">❌ Faltó</button>
-              <!-- ✅ Aquí está ahora el botón en el Calendario -->
               <button v-if="accionesDe(sesionSeleccionada).puedeReprogramar" class="accion-btn reprogramar"
                 @click="abrirModalReprogramar(sesionSeleccionada)">🔄 Reprogramar</button>
               <button v-if="accionesDe(sesionSeleccionada).puedeCancelar" class="accion-btn cancelar"
@@ -457,13 +582,77 @@ const obtenerSituacionCita = (sesion) => {
     <ModalNuevaCita :tarifario="tarifario" :isOpen="showModalNueva" :fisios="fisios" :pacientes="pacientes"
       :paquetes="paquetes" :loadingAccion="loadingAccion" :saldoPaciente="saldoPaciente"
       :obtenerSlots="obtenerSlotsDisponibles" :onFetchSaldoPaciente="fetchSaldoPaciente"
-      :onFetchEvaluaciones="fetchEvaluacionesHuerfanas" @close="showModalNueva = false" @submit="handleNuevaCita"
+      :onFetchEvaluaciones="fetchEvaluacionesHuerfanas" :tratamientoARecargar="tratamientoParaRecargar"
+      @close="showModalNueva = false; tratamientoParaRecargar = null" @submit="handleNuevaCita"
       @paciente-changed="fetchPaquetesPaciente" @fisio-changed="fetchHorarioFisio"
       @reset-saldo="saldoPaciente = null" />
     <ModalConfirmarPago :isOpen="showModalPago" :sesion="sesionSeleccionada" :loadingAccion="loadingAccion"
       @close="showModalPago = false" @submit="handleConfirmarPago" />
     <ModalReprogramarCita :isOpen="showModalReprogramar" :sesion="sesionSeleccionada" :fisios="fisios"
       :loadingAccion="loadingAccion" @close="showModalReprogramar = false" @submit="handleReprogramar" />
+
+    <!-- ── MODAL: VER REGISTRO DE LA SESIÓN ── -->
+    <Transition name="fade-modal">
+      <div v-if="showModalRegistro" class="modal-overlay" @click.self="showModalRegistro = false">
+        <div class="modal-window" style="max-width: 500px;">
+          <div class="modal-header">
+            <h3>Registro Clínico de la Sesión</h3>
+            <button class="close-x" @click="showModalRegistro = false">&times;</button>
+          </div>
+
+          <div class="modal-form" style="padding: 20px;">
+            <div v-if="loadingRegistro" style="text-align: center; color: #64748b;">
+              <span class="spinner" style="display:inline-block; margin-right:8px;"></span> Cargando apuntes...
+            </div>
+
+            <div v-else-if="registroSeleccionado">
+              <p style="margin-top: 0;"><strong>Paciente:</strong> {{ nombrePacienteFlat(registroSeleccionado) }}</p>
+              <p><strong>Atendido por:</strong> {{ nombreFisioFlat(registroSeleccionado) }}</p>
+              <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 15px 0;">
+
+              <!-- Si fue una sesión de Evaluación -->
+              <div v-if="registroSeleccionado.es_evaluacion_inicial"
+                style="background: #f0fdfa; padding: 12px; border-radius: 8px; border: 1px solid #5eead4; color: #0f766e;">
+                <strong>📌 Evaluación Inicial Realizada</strong>
+                <p style="font-size: 13.5px; margin-top: 6px;">El fisioterapeuta completó la ficha estructural. Por
+                  favor, diríjase al <strong>Historial Clínico</strong> del paciente para ver el documento completo.</p>
+              </div>
+
+              <!-- Si fue una sesión de Seguimiento normal -->
+              <div v-else>
+                <div v-if="registroSeleccionado.evolucion_clinica?.eva !== undefined" style="margin-bottom: 16px;">
+                  <strong>Evolución Rápida:</strong><br>
+                  <span
+                    style="display: inline-block; background: #f1f5f9; padding: 4px 8px; border-radius: 4px; font-size: 13px; margin-top: 4px;">
+                    Dolor EVA: {{ registroSeleccionado.evolucion_clinica.eva }}/10 | Estado: {{
+                      registroSeleccionado.evolucion_clinica.funcion }}
+                  </span>
+                </div>
+
+                <div style="margin-bottom: 16px;">
+                  <strong>Notas de Evolución:</strong>
+                  <p
+                    style="white-space: pre-wrap; font-size: 14px; background: #f8fafc; padding: 10px; border-radius: 6px; border: 1px solid #e2e8f0; margin-top: 4px;">
+                    {{ registroSeleccionado.notas_evolucion || 'Sin notas registradas.' }}</p>
+                </div>
+
+                <div>
+                  <strong>Indicaciones para casa:</strong>
+                  <p
+                    style="white-space: pre-wrap; font-size: 14px; background: #fffbeb; padding: 10px; border-radius: 6px; border: 1px solid #fde68a; margin-top: 4px;">
+                    {{ registroSeleccionado.indicaciones || 'Ninguna indicación adicional.' }}</p>
+                </div>
+              </div>
+
+            </div>
+          </div>
+
+          <div class="modal-actions" style="padding: 15px; border-top: 1px solid #eee;">
+            <button class="btn-secondary" @click="showModalRegistro = false">Cerrar</button>
+          </div>
+        </div>
+      </div>
+    </Transition>
 
     <Transition name="fade-modal">
       <div v-if="showModalCancelacion" class="modal-overlay" @click.self="showModalCancelacion = false">
@@ -597,6 +786,29 @@ const obtenerSituacionCita = (sesion) => {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
+}
+
+/* Etiqueta para la tabla y modal */
+.tratamiento-pill {
+  display: inline-flex;
+  align-items: center;
+  margin-top: 4px;
+  padding: 2px 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  border-radius: 4px;
+  border: 1px solid;
+  letter-spacing: 0.3px;
+}
+
+/* Etiqueta miniatura para el calendario */
+.cita-ciclo-mini {
+  font-size: 9.5px;
+  font-weight: 800;
+  padding: 1px 4px;
+  border-radius: 4px;
+  margin-left: 4px;
+  flex-shrink: 0;
 }
 
 .accion-btn {

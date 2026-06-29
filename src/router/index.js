@@ -37,12 +37,6 @@ const router = createRouter({
           meta: { roles: ['secretaria', 'fisioterapeuta', 'admin', 'paciente'] }
         },
         {
-          path: 'expedientes',
-          name: 'expedientes',
-          component: () => import('@/views/ExpedientesView.vue'),
-          meta: { roles: ['fisioterapeuta', 'admin'] } // Solo el área clínica
-        },
-        {
           path: 'configuracion',
           name: 'configuracion',
           component: () => import('@/views/ConfiguracionView.vue'),
@@ -67,11 +61,18 @@ const router = createRouter({
           meta: { roles: ['fisioterapeuta'] } // Solo equipo clínico / gestión
         },
         {
-          path: 'atencion/:idSesion', 
+          path: 'atencion/:idSesion',
           name: 'atencion',
           component: () => import('@/views/AtencionView.vue'),
           meta: { roles: ['fisioterapeuta', 'admin'] } // Solo equipo clínico y admin
         },
+        {
+          path: '/paciente/:idPaciente/historia-clinica',
+          name: 'HistoriaClinica',
+          component: () => import('@/views/HistoriaClinicaView.vue'),
+          props: true,
+          meta: { roles: ['fisioterapeuta', 'admin'] }
+        }
       ]
     },
     {

@@ -109,9 +109,13 @@ const handleSubmit = async () => {
     return
   }
 
-  // 2. Aplicar lógica de negocio (Forzar nombre y sesiones para Sesión Individual)
-  if (form.value.tipo === 'sesion_suelta' || form.value.tipo === 'masaje') {
+  // 2. Aplicar lógica de negocio (Forzar nombre y sesiones)
+  if (form.value.tipo === 'sesion_suelta') {
     form.value.nombre = 'Sesión Individual'
+    form.value.cantidad_sesiones = 1
+  } else if (form.value.tipo === 'masaje') {
+    // Le asignamos un nombre específico para que no se mezcle en caja
+    form.value.nombre = 'Sesión de Masajes'
     form.value.cantidad_sesiones = 1
   } else {
     // Si es paquete, validamos el nombre obligatorio

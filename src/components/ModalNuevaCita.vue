@@ -70,7 +70,15 @@ const permiteSesionesFuturas = computed(() => {
 // ── Algoritmo Dinámico de Combinación Óptima (Catálogo) ──────────────────────
 const paquetesDisponibles = computed(() => props.tarifario.filter(t => t.tipo === 'paquete'))
 const paqueteSeleccionado = ref(null)
-const precioSesionSuelta = computed(() => props.tarifario.find(t => t.tipo === 'sesion_suelta')?.precio || 0)
+const servicioSuelto = computed(() => {
+  // Si la modalidad es masaje, buscamos el servicio de masajes en el catálogo
+  if (modalidad.value === 'masaje') {
+    return props.tarifario.find(t => t.tipo === 'masaje' || t.nombre.toLowerCase().includes('masaje')) || {}
+  }
+  // Si es un tratamiento normal, buscamos la sesión suelta estándar
+  return props.tarifario.find(t => t.tipo === 'sesion_suelta') || {}
+})
+const precioSesionSuelta = computed(() => servicioSuelto.value.precio || 0)
 const precioMasajeSuelto = computed(() => props.tarifario.find(t => t.tipo === 'masaje')?.precio || 0)
 
 const paqueteSeleccionadoData = computed(() => paquetesDisponibles.value.find(p => p.idServicio === paqueteSeleccionado.value))
@@ -79,7 +87,7 @@ const paqueteSeleccionadoData = computed(() => paquetesDisponibles.value.find(p 
 watch(paquetesDisponibles, (val) => {
   if (val.length > 0 && !paqueteSeleccionado.value) {
     // Ordenamos de mayor a menor y seleccionamos el primero
-    const ordenados = [...val].sort((a, b) => (b.cantidad_sesiones || 1) - (a.cantidad_sesiones || 1))
+    const ordenados = [...val].sort((a, b) => (a.cantidad_sesiones || 1) - (b.cantidad_sesiones || 1))
     paqueteSeleccionado.value = ordenados[0].idServicio
   }
 }, { immediate: true })
@@ -122,7 +130,7 @@ const precioEstimado = computed(() => {
   const mod = modalidad.value
   if (!mod || mod === 'evaluacion_inicial') return 0
   if (mod === 'masaje') return sesionesDeseadas.value * precioMasajeSuelto.value
-  
+
   if (mod === 'tratamiento') {
     const precioPaquete = paqueteSeleccionadoData.value?.precio || 0
     return (inputPaquetes.value * precioPaquete) + (inputSueltas.value * precioSesionSuelta.value)
@@ -143,17 +151,30 @@ watch(paqueteSeleccionado, (nuevoIdPaquete) => {
 })
 
 const maxSesionesAdicionales = computed(() => {
-  if (esRecarga.value || vieneDeEvaluacionPrevia.value) return sesionesDeseadas.value
-  // Si es un ciclo nuevo, la sesión #1 ya se agenda en la parte superior,
-  // por lo que las opcionales solo pueden ser (Total - 1)
-  return Math.max(0, sesionesDeseadas.value - 1)
+  if (modalidad.value === 'tratamiento') {
+    // Tanto si es nuevo (1 Eval + 5 Sesiones = 5 cajas) 
+    // como si es recarga (Ocultamos el principal + 5 Sesiones = 5 cajas)
+    return sesionesDeseadas.value || 0;
+  }
+  if (modalidad.value === 'masaje') {
+    return esRecarga.value ? sesionesDeseadas.value : Math.max(0, sesionesDeseadas.value - 1);
+  }
+  return 0;
 })
 
 const puedeAgregarMasSesiones = computed(() => sesionesOpcionales.value.length < maxSesionesAdicionales.value)
 
 watch(maxSesionesAdicionales, (max) => {
+  // 1. Si baja la cantidad, borramos las cajas que sobran
   if (sesionesOpcionales.value.length > max) {
     sesionesOpcionales.value = sesionesOpcionales.value.slice(0, max)
+  }
+  // 2. Si sube la cantidad, agregamos las cajas automáticamente
+  else if (sesionesOpcionales.value.length < max) {
+    const faltantes = max - sesionesOpcionales.value.length;
+    for (let i = 0; i < faltantes; i++) {
+      agregarSesionOpcional();
+    }
   }
 })
 
@@ -215,13 +236,19 @@ const loadingSlots = ref(false)
 
 const slotsFiltrados = computed(() => {
   if (loadingSlots.value) return []
-  const ahora = new Date()
-  const fechaHoy = ahora.toISOString().split('T')[0]
 
-  if (fecha.value !== fechaHoy) return slotsDisponibles.value
+  // 1. Obtenemos "hoy" estrictamente en hora de Perú (YYYY-MM-DD)
+  const fechaHoy = getTodayISO()
 
-  const horaActual = ahora.getHours()
-  const minActual = ahora.getMinutes()
+  // 2. Si el día elegido NO es hoy (ej. es mañana), devolvemos todos los horarios libres
+  if (fecha.value !== fechaHoy) {
+    return slotsDisponibles.value
+  }
+
+  // 3. Si el día elegido SÍ es hoy, ocultamos las horas que ya pasaron
+  const ahoraPeru = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Lima" }));
+  const horaActual = ahoraPeru.getHours()
+  const minActual = ahoraPeru.getMinutes()
 
   return slotsDisponibles.value.filter(slot => {
     const [h, m] = slot.split(':').map(Number)
@@ -276,10 +303,29 @@ watch(() => props.isOpen, (abierto) => {
 const resetForm = () => {
   if (props.tratamientoARecargar) {
     modalidad.value = 'tratamiento'
-    sesionesDeseadas.value = 5
+    sesionesDeseadas.value = 1
     overrideSecretaria.value = false
+
     idPaciente.value = props.tratamientoARecargar.idPaciente
-    idFisioterapeuta.value = props.tratamientoARecargar.idFisioterapeuta
+    searchPaciente.value = props.tratamientoARecargar.nombrePaciente
+    idFisioterapeuta.value = props.tratamientoARecargar.idFisioterapeuta || null
+    searchFisio.value = props.tratamientoARecargar.nombreFisio || ''
+
+    // 👇 NUEVA LÓGICA DE DETECCIÓN 👇
+    if (props.tratamientoARecargar.idTratamiento) {
+      // Es una recarga normal (ya existe el tratamiento)
+      vieneDeEvaluacionPrevia.value = false;
+      idEvaluacionSesion.value = null;
+    } else if (props.tratamientoARecargar.idEvaluacionSesion) {
+      // Es la compra de un paquete anclado a la evaluación que acabas de clickear
+      vieneDeEvaluacionPrevia.value = true;
+      idEvaluacionSesion.value = props.tratamientoARecargar.idEvaluacionSesion;
+      // Para que el select oculto no se rompa, le inyectamos una opción ficticia
+      evaluacionesDisponibles.value = [{
+        idSesion: props.tratamientoARecargar.idEvaluacionSesion,
+        label: 'Evaluación Seleccionada (' + props.tratamientoARecargar.nombrePaciente + ')'
+      }];
+    }
   } else {
     idPaciente.value = null
     searchPaciente.value = ''
@@ -300,29 +346,49 @@ const resetForm = () => {
 
 // ── Envío del Formulario ────────────────────────────────────────────────────
 const handleSubmit = () => {
-  const sesionesExtra = sesionesOpcionales.value
+  let principalFecha = fecha.value
+  let principalHora = hora.value
+  let extraFechas = [...sesionesOpcionales.value]
+
+  // 👇 EL TRUCO: Si es recarga (selector principal oculto), tomamos la 1° fecha de la lista
+  if (esRecarga.value && extraFechas.length > 0) {
+    const primera = extraFechas.shift() // Saca la primera de la lista opcional
+    principalFecha = primera.fecha
+    principalHora = primera.hora
+  }
+
+  const sesionesExtraFormateadas = extraFechas
     .filter(s => s.fecha && s.hora)
     .map(s => `${s.fecha}T${s.hora}:00-05:00`)
 
   const payload = {
     idPaciente: idPaciente.value,
     idFisioterapeuta: idFisioterapeuta.value,
-    fecha_hora: fecha.value && hora.value ? `${fecha.value}T${hora.value}:00-05:00` : null,
+    fecha_hora: principalFecha && principalHora ? `${principalFecha}T${principalHora}:00-05:00` : null,
     modalidad: modalidad.value,
     observaciones: observaciones.value,
-    sesionesOpcionales: sesionesExtra,
-
-    // Propiedades de la transacción de ciclo clínico continuo
+    sesionesOpcionales: sesionesExtraFormateadas,
     idTratamientoExistente: props.tratamientoARecargar?.idTratamiento || null,
     vieneDeEvaluacionPrevia: vieneDeEvaluacionPrevia.value,
     idEvaluacionSesion: vieneDeEvaluacionPrevia.value ? idEvaluacionSesion.value : null,
 
+    // 👇 AQUÍ ESTÁ LA CORRECCIÓN 👇
     tratamientoConfig: {
       sesionesDeseadas: sesionesDeseadas.value,
       paquetes: inputPaquetes.value,
       sueltas: inputSueltas.value,
       costoTotal: precioEstimado.value,
-      tamanoPaquete: paqueteSeleccionadoData.value?.cantidad_sesiones || 1 // ✅ AHORA SÍ ESTÁ ADENTRO
+      tamanoPaquete: paqueteSeleccionadoData.value?.cantidad_sesiones || 1,
+
+      // Datos explícitos para que el composable cree el "Paquete" sin errores
+      idServicioPaquete: paqueteSeleccionadoData.value?.idServicio || null,
+      nombrePaquete: paqueteSeleccionadoData.value?.nombre || 'Paquete Clínico',
+      precioPaquete: paqueteSeleccionadoData.value?.precio || 0,
+
+      // Datos explícitos para las "Sesiones Sueltas"
+      idServicioSuelta: servicioSuelto.value.idServicio || null,
+      nombreSuelta: servicioSuelto.value.nombre || 'Sesión Suelta',
+      precioSuelta: servicioSuelto.value.precio || 0
     }
   }
 
@@ -342,41 +408,37 @@ const nombrePaciente = (p) => `${p.Persona?.nombres ?? ''} ${p.Persona?.apellido
       <div class="modal-window modal-cita">
 
         <div class="modal-header">
-          <h3>{{ esRecarga ? 'Recargar Sesiones de Tratamiento' : 'Registrar Nueva Cita / Ciclo' }}</h3>
+          <h3>{{ esRecarga ? 'Agregar Sesiones al Tratamiento' : 'Registrar Nueva Cita / Ciclo' }}</h3>
           <button class="close-x" @click="emit('close')" :disabled="loadingAccion">&times;</button>
         </div>
 
         <form @submit.prevent="handleSubmit" class="modal-form" novalidate>
 
-          <div v-if="esRecarga" class="resumen-box"
-            style="border-color: #0f766e; background: #f0fdfa; margin-bottom: 15px;">
-            <span class="resumen-icono">🔄</span>
-            <div>
-              <strong>Paciente: {{ tratamientoARecargar.nombrePaciente }}</strong>
-              <p>Tratamiento #{{ tratamientoARecargar.idTratamiento }} — Cuenta actualmente con {{
-                tratamientoARecargar.sesionesRestantes }} sesiones en su saldo.</p>
-            </div>
-          </div>
-
-          <div v-if="!esRecarga" class="form-section">
+          <div class="form-section">
             <p class="section-label">1. Participantes</p>
             <div class="form-grid">
 
               <div class="input-group" style="position: relative;">
                 <label>Paciente <span class="req">*</span></label>
-                <input type="text" v-model="searchPaciente" @focus="showPacienteList = true" @blur="hidePacienteDelay"
-                  placeholder="🔍 Buscar por nombre o DNI..." required class="search-input"
+
+                <input v-if="esRecarga" type="text" :value="tratamientoARecargar.nombrePaciente" disabled
+                  class="search-input is-selected"
+                  style="background-color: #f1f5f9; font-weight: bold; color: #334155; cursor: not-allowed;" />
+
+                <input v-else type="text" v-model="searchPaciente" @focus="showPacienteList = true"
+                  @blur="hidePacienteDelay" placeholder="🔍 Buscar por nombre o DNI..." required class="search-input"
                   :class="{ 'is-selected': idPaciente }" />
+
                 <span v-if="idPaciente" class="valid-check">✅</span>
 
-                <div v-if="idPaciente" class="field-hint" style="margin-top: 5px;">
+                <div v-if="idPaciente && !esRecarga" class="field-hint" style="margin-top: 5px;">
                   <span>Saldo actual disponible: </span>
                   <strong :class="saldoPaciente > 0 ? 'text-green' : 'text-red'">
                     {{ saldoPaciente }} sesiones
                   </strong>
                 </div>
 
-                <ul v-if="showPacienteList && pacientesFiltrados.length > 0" class="options-list">
+                <ul v-if="showPacienteList && pacientesFiltrados.length > 0 && !esRecarga" class="options-list">
                   <li v-for="p in pacientesFiltrados" :key="p.idPaciente" @click="seleccionarPaciente(p)">
                     <div class="li-name">{{ p.Persona?.nombres }} {{ p.Persona?.apellidos }}</div>
                     <div class="li-sub">Doc: {{ p.Persona?.numero_documento || 'S/N' }}</div>
@@ -385,7 +447,7 @@ const nombrePaciente = (p) => `${p.Persona?.nombres ?? ''} ${p.Persona?.apellido
               </div>
 
               <div class="input-group" style="position: relative;">
-                <label>Fisioterapeuta Evalúa <span class="req">*</span></label>
+                <label>Fisioterapeuta Asignado <span class="req">*</span></label>
                 <input type="text" v-model="searchFisio" @focus="showFisioList = true" @blur="hideFisioDelay"
                   placeholder="🔍 Buscar especialista..." required class="search-input"
                   :class="{ 'is-selected': idFisioterapeuta }" />
@@ -418,16 +480,16 @@ const nombrePaciente = (p) => `${p.Persona?.nombres ?? ''} ${p.Persona?.apellido
           <Transition name="slide-input">
             <div v-if="['tratamiento', 'masaje'].includes(modalidad)" class="form-section"
               style="background: #f8fafc; padding: 15px; border-radius: 8px;">
-              <p class="section-label" style="color: #0f766e;">3. Configuración de Sesiones</p>
+              <p class="section-label" style="color: #0f766e;">{{ esRecarga ? '2.' : '3.' }} Configuración de Compra</p>
 
               <div class="form-grid" style="margin-top: 5px;">
                 <div class="input-group">
-                  <label>¿Cuántas sesiones en total necesita?</label>
+                  <label>¿Cuántas sesiones nuevas agregará?</label>
                   <input type="number" v-model.number="sesionesDeseadas" min="1" max="50" required />
                 </div>
 
                 <div v-if="modalidad === 'tratamiento'" class="input-group">
-                  <label>Paquete a aplicar</label>
+                  <label>Tarifa a aplicar</label>
                   <select v-model="paqueteSeleccionado" @change="overrideSecretaria = false" required>
                     <option v-for="p in paquetesDisponibles" :key="p.idServicio" :value="p.idServicio">
                       {{ p.nombre }} ({{ p.cantidad_sesiones }} ses.) — S/ {{ p.precio }}
@@ -438,21 +500,21 @@ const nombrePaciente = (p) => `${p.Persona?.nombres ?? ''} ${p.Persona?.apellido
 
               <div v-if="modalidad === 'tratamiento'" class="form-grid" style="margin-top: 10px;">
                 <div class="input-group span-2">
-                  <label>Desglose Tarifario Sugerido</label>
+                  <label>Desglose Tarifario Automático</label>
                   <div class="preview-calculo"
                     style="padding: 8px; border: 1px solid #cbd5e1; border-radius: 6px; background: #fff; font-size: 12.5px;">
                     <div>📦 Paquete "{{ paqueteSeleccionadoData?.nombre || 'Base' }}" ({{
                       paqueteSeleccionadoData?.cantidad_sesiones || 1 }} ses.): <strong>{{ inputPaquetes }}</strong> (S/
-                      {{ (inputPaquetes * (paqueteSeleccionadoData?.precio || 0)).toFixed(2) }})</div>
+                      {{
+                        (inputPaquetes * (paqueteSeleccionadoData?.precio || 0)).toFixed(2) }})</div>
                     <div>💆 Sesiones sueltas: <strong>{{ inputSueltas }}</strong> (S/ {{ (inputSueltas *
                       precioSesionSuelta).toFixed(2) }})</div>
                   </div>
-
                   <div style="margin-top: 5px;">
                     <input type="checkbox" id="chkManual" v-model="overrideSecretaria" />
                     <label for="chkManual"
-                      style="font-size: 11.5px; margin-left: 5px; cursor: pointer; color: #475569;">Ajustar combinación
-                      manualmente</label>
+                      style="font-size: 11.5px; margin-left: 5px; cursor: pointer; color: #475569;">Ajustar
+                      combinación manualmente</label>
                   </div>
                 </div>
               </div>
@@ -471,53 +533,20 @@ const nombrePaciente = (p) => `${p.Persona?.nombres ?? ''} ${p.Persona?.apellido
             </div>
           </Transition>
 
-          <Transition name="slide-input">
-            <div v-if="modalidad === 'tratamiento' && !esRecarga && evaluacionesDisponibles.length > 0"
-              class="form-section">
-              <div style="display: flex; align-items: center; gap: 8px;">
-                <input type="checkbox" id="chkVieneEval" v-model="vieneDeEvaluacionPrevia" />
-                <label for="chkVieneEval" style="font-weight: 700; font-size: 12px; cursor: pointer; color: #0f766e;">
-                  ¿Este tratamiento corresponde a una evaluación ya realizada antes?
-                </label>
-              </div>
-
-              <div v-if="vieneDeEvaluacionPrevia" class="input-group" style="margin-top: 8px;">
-                <label>Seleccionar Evaluación del Historial <span class="req">*</span></label>
-                <select v-model="idEvaluacionSesion" required>
-                  <option value="null" disabled>— Seleccione la evaluación previa —</option>
-                  <option v-for="ev in evaluacionesDisponibles" :key="ev.idSesion" :value="ev.idSesion">
-                    {{ ev.label }}
-                  </option>
-                </select>
-                <p class="field-hint nota-evaluacion">
-                  💡 Al seleccionar esto, el tratamiento se anclará a esa cita y no se agendará una nueva evaluación
-                  diagnóstica hoy.
-                </p>
-              </div>
-            </div>
-          </Transition>
-
-          <div v-if="modalidad && !(vieneDeEvaluacionPrevia && !esRecarga)" class="form-section">
+          <div v-if="modalidad && !esRecarga" class="form-section">
             <p class="section-label">
-              {{ modalidad === 'evaluacion_inicial' ? '3.' : '4.' }} Fecha y Horario de Atención
+              {{ modalidad === 'evaluacion_inicial' ? '3.' : '4.' }} Fecha y Horario (Evaluación Inicial)
             </p>
             <div class="form-grid">
               <div class="input-group">
-                <label>{{ modalidad === 'tratamiento' ? 'Fecha Primera Sesión' : 'Fecha de la Cita' }} <span
-                    class="req">*</span></label>
-                <input type="date" v-model="fecha" :min="fechaMin"
-                  :required="!(vieneDeEvaluacionPrevia && !esRecarga)" />
+                <label>Fecha <span class="req">*</span></label>
+                <input type="date" v-model="fecha" :min="fechaMin" required />
               </div>
               <div class="input-group">
                 <label>Horario disponible <span class="req">*</span></label>
-                <select v-model="hora" :required="!(vieneDeEvaluacionPrevia && !esRecarga)"
-                  :disabled="!fecha || !idFisioterapeuta || loadingSlots">
+                <select v-model="hora" required :disabled="!fecha || !idFisioterapeuta || loadingSlots">
                   <option value="" disabled>
-                    {{
-                      loadingSlots ? 'Buscando huecos libres...' :
-                        (!idFisioterapeuta ? '⚠️ Falta Especialista' :
-                          (!fecha ? '⚠️ Falta Fecha' : '— Seleccione hora —'))
-                    }}
+                    {{ loadingSlots ? 'Buscando huecos libres...' : (!idFisioterapeuta ? '⚠️ Falta Especialista' :(!fecha ? '⚠️ Falta Fecha' : (slotsFiltrados.length === 0 ? '❌ No hay turnos ese día' : '— Seleccione hora —'))) }}
                   </option>
                   <option v-for="slot in slotsFiltrados" :key="slot" :value="slot">{{ slot }}</option>
                 </select>
@@ -525,48 +554,60 @@ const nombrePaciente = (p) => `${p.Persona?.nombres ?? ''} ${p.Persona?.apellido
 
               <div class="input-group span-2">
                 <label>Observaciones Clínicas / Administrativas</label>
-                <input type="text" v-model="observaciones"
-                  placeholder="Ej: Dolor lumbar crónico, requiere compresión fría" maxlength="200" />
+                <input type="text" v-model="observaciones" placeholder="Ej: Pago pendiente parcial..."
+                  maxlength="200" />
               </div>
             </div>
           </div>
 
           <Transition name="slide-input">
-            <div v-if="permiteSesionesFuturas && !(vieneDeEvaluacionPrevia && !esRecarga)" class="form-section"
-              style="background: #f8fafc; padding: 15px; border-radius: 8px; border: 1px dashed #0ea5e9;">
-              <div style="display: flex; justify-content: space-between; align-items: baseline;">
-                <p class="section-label" style="color: #0ea5e9;">Agendar Siguientes Sesiones en Agenda</p>
-                <span style="font-size: 11px; font-weight: bold; color: #475569;">{{ sesionesOpcionales.length }} de {{
-                  maxSesionesAdicionales }} posibles</span>
-              </div>
-              <p class="field-hint">Si el paciente ya definió su disponibilidad, programe hasta {{
-                maxSesionesAdicionales }} sesiones adicionales.</p>
+            <div v-if="permiteSesionesFuturas" class="form-section"
+              style="background: #f0f9ff; padding: 15px; border-radius: 8px; border-left: 4px solid #0284c7; margin-top: 15px;">
 
-              <div v-for="(sesion, index) in sesionesOpcionales" :key="index" class="form-grid"
-                style="margin-top: 15px; padding-top: 15px; border-top: 1px solid #e2e8f0;">
+              <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                <p class="section-label" style="margin: 0; color: #0369a1;">
+                  📅 Agendar las siguientes sesiones (Opcional)
+                </p>
+                <span
+                  style="font-size: 12px; font-weight: bold; color: #0284c7; background: #e0f2fe; padding: 2px 8px; border-radius: 12px;">
+                  {{ sesionesOpcionales.length }} de {{ maxSesionesAdicionales }}
+                </span>
+              </div>
+
+              <p style="font-size: 12px; color: #475569; margin-bottom: 15px; line-height: 1.4;">
+                Puedes agendar las fechas restantes ahora mismo, o dejarlas como "Saldo" para que el paciente las
+                programe después.
+              </p>
+
+              <div v-for="(sesionExtra, index) in sesionesOpcionales" :key="index" class="form-grid"
+                style="margin-bottom: 12px; align-items: end; background: white; padding: 10px; border-radius: 6px; border: 1px solid #bae6fd;">
+
                 <div class="input-group">
-                  <label>Fecha Terápica {{ (vieneDeEvaluacionPrevia || esRecarga) ? index + 1 : index + 2 }}</label>
-                  <input type="date" v-model="sesion.fecha" :min="fechaMin" @change="buscarSlotsParaOpcional(index)" />
+                  <label style="color: #0284c7; font-weight: bold;">Sesión #{{ index + 1 }}</label>
+                  <input type="date" v-model="sesionExtra.fecha" :min="fechaMin"
+                    @change="buscarSlotsParaOpcional(index)" required />
                 </div>
+
                 <div class="input-group">
                   <label>Hora</label>
-                  <select v-model="sesion.hora" :disabled="!sesion.fecha || sesion.loading">
-                    <option value="" disabled>{{ sesion.loading ? 'Buscando huecos...' : (sesion.fecha ? '— Seleccione hora —' : '⚠️ Elija fecha') }}</option>
-                    <option v-for="slot in sesion.slots" :key="slot" :value="slot">{{ slot }}</option>
+                  <select v-model="sesionExtra.hora" required :disabled="!sesionExtra.fecha || sesionExtra.loading">
+                    <option value="" disabled>
+                      {{ sesionExtra.loading ? 'Buscando...' : (sesionExtra.slots?.length ? '— Seleccionar —' : 'Sin turnos') }}
+                    </option>
+                    <option v-for="slot in sesionExtra.slots" :key="slot" :value="slot">{{ slot }}</option>
                   </select>
                 </div>
-                <div style="grid-column: span 2; text-align: right;">
-                  <button type="button" @click="sesionesOpcionales.splice(index, 1)"
-                    style="color: #ef4444; background: none; border: none; font-size: 12px; cursor: pointer; font-weight: bold;">
-                    &times; Remover esta fecha
-                  </button>
-                </div>
+
+                <button type="button" @click="sesionesOpcionales.splice(index, 1)"
+                  style="height: 40px; padding: 0 15px; background: #fee2e2; color: #ef4444; border: none; border-radius: 6px; cursor: pointer; font-weight: bold;"
+                  title="Quitar sesión">
+                  🗑️
+                </button>
               </div>
 
-              <button type="button" class="btn-secondary" @click="agregarSesionOpcional"
-                :disabled="!puedeAgregarMasSesiones" style="margin-top: 12px; width: 100%; justify-content: center;"
-                :style="!puedeAgregarMasSesiones ? 'opacity: 0.5; cursor: not-allowed;' : ''">
-                {{ puedeAgregarMasSesiones ? '+ Programar otra fecha en lote' : 'Límite de sesiones alcanzado' }}
+              <button v-if="puedeAgregarMasSesiones" type="button" @click="agregarSesionOpcional"
+                style="width: 100%; padding: 10px; background: transparent; border: 1px dashed #0284c7; color: #0284c7; border-radius: 6px; cursor: pointer; font-weight: 600; margin-top: 5px; transition: background 0.2s;">
+                ➕ Añadir otra fecha al calendario
               </button>
             </div>
           </Transition>
@@ -575,14 +616,6 @@ const nombrePaciente = (p) => `${p.Persona?.nombres ?? ''} ${p.Persona?.apellido
             <span class="resumen-icono">{{ modalidadActual?.icono || '💰' }}</span>
             <div style="width: 100%;">
               <strong>Monto Total de Operación Administrativa</strong>
-              <p v-if="modalidad === 'tratamiento'">
-                Cobro combinado de {{ sesionesDeseadas }} sesiones clínicas de fisioterapia.
-              </p>
-              <p v-else-if="modalidad === 'masaje'">
-                Cobro por tarifa plana de {{ sesionesDeseadas }} sesiones de masajes relajantes/descontracturantes.
-              </p>
-              <p v-else>Consulta diagnóstica inicial sin costo para el paciente.</p>
-
               <div class="precio-badge" style="margin-top: 10px; font-size: 15px; padding: 6px 12px;">
                 Total a Pagar en Caja: <strong>S/ {{ Number(precioEstimado).toFixed(2) }}</strong>
               </div>
@@ -590,13 +623,12 @@ const nombrePaciente = (p) => `${p.Persona?.nombres ?? ''} ${p.Persona?.apellido
           </div>
 
           <div class="modal-actions">
-            <button type="button" class="btn-secondary" @click="emit('close')" :disabled="loadingAccion">
-              Cancelar
-            </button>
+            <button type="button" class="btn-secondary" @click="emit('close')"
+              :disabled="loadingAccion">Cancelar</button>
             <button type="submit" class="btn-primary-submit"
-              :disabled="loadingAccion || !idPaciente || !idFisioterapeuta || (!modalidad) || (!fecha && !(vieneDeEvaluacionPrevia && !esRecarga))">
+              :disabled="loadingAccion || !idPaciente || !idFisioterapeuta || (!esRecarga && !fecha) || (esRecarga && !sesionesOpcionales[0]?.fecha)">
               <span v-if="loadingAccion" class="btn-spinner"></span>
-              <span v-else>{{ esRecarga ? 'Confirmar Recarga de Saldo' : 'Registrar Operación' }}</span>
+              <span v-else>{{ esRecarga ? 'Confirmar Compra y Agendar' : 'Registrar Operación' }}</span>
             </button>
           </div>
 
